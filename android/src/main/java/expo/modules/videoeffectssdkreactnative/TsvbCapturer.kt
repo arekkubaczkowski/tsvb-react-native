@@ -63,6 +63,10 @@ class TsvbCapturer(
     @Volatile
     private var isProcessingFrame = false
 
+    // One-time log when first frame arrives — diagnoses pipeline-started-but-stuck cases
+    @Volatile
+    private var hasLoggedFirstFrame = false
+
     // Frame capture
     @Volatile
     var isFrameCaptureEnabled = false
@@ -92,6 +96,11 @@ class TsvbCapturer(
     private val frameListener = OnFrameAvailableListener { bitmap, timestamp ->
         if (!isPipelineActive) return@OnFrameAvailableListener
         val observer = capturerObserver ?: return@OnFrameAvailableListener
+
+        if (!hasLoggedFirstFrame) {
+            hasLoggedFirstFrame = true
+            Log.i(TAG, "First frame received: ${bitmap.width}x${bitmap.height}")
+        }
 
         // Drop frame if previous conversion is still in progress (prevents backpressure lag)
         if (isProcessingFrame) return@OnFrameAvailableListener
@@ -186,15 +195,27 @@ class TsvbCapturer(
             pipeline.setOnFrameAvailableListener(frameListener)
             // Only call startPipeline on first creation — pipeline stays running across stop/start
             if (!manager.isPipelineRunning) {
-                pipeline.startPipeline()
-                manager.isPipelineRunning = true
-                Log.d(TAG, "Pipeline started (first time)")
+                try {
+                    Log.i(TAG, "Calling pipeline.startPipeline()")
+                    pipeline.startPipeline()
+                    manager.isPipelineRunning = true
+                    Log.i(TAG, "Pipeline started (first time)")
+                } catch (e: Throwable) {
+                    Log.e(TAG, "pipeline.startPipeline() threw — releasing and falling back", e)
+                    pipeline.setOnFrameAvailableListener(null)
+                    manager.releasePipeline()
+                    isPipelineActive = false
+                    isUsingFallback = true
+                    startFallbackCapturer(width, height, fps)
+                    return
+                }
             } else {
                 Log.d(TAG, "Pipeline already running, reattached listener")
             }
             isPipelineActive = true
             isUsingFallback = false
             eventsHandler.onCameraOpening(device)
+            Log.i(TAG, "onCameraOpening dispatched to LiveKit")
         } else {
             Log.e(TAG, "Effects SDK pipeline failed — falling back to standard camera")
             isUsingFallback = true

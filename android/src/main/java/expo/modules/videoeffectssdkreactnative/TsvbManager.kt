@@ -261,9 +261,11 @@ class TsvbManager(private val context: Context) {
             }
 
             try {
+                Log.i(TAG, "Calling EffectsSDK.createSDKFactory()")
                 val factory = EffectsSDK.createSDKFactory()
                 val camera = detectCamera(cameraName)
                 val emptyBitmap = Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)
+                Log.i(TAG, "Calling factory.createCameraPipeline(${width}x${height}, camera=$camera)")
                 val pipeline = factory.createCameraPipeline(
                     context,
                     optionsCache.pipelineMode,
@@ -284,9 +286,9 @@ class TsvbManager(private val context: Context) {
                 cameraPipeline = pipeline
                 pipelineWidth = width
                 pipelineHeight = height
-                Log.d(TAG, "Created new pipeline: ${width}x${height}, camera=$camera")
+                Log.i(TAG, "Created new pipeline: ${width}x${height}, camera=$camera")
                 return pipeline
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 Log.e(TAG, "Failed to create pipeline", e)
                 return null
             }
