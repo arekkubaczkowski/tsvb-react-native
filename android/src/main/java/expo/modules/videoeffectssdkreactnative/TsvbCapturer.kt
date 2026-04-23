@@ -100,6 +100,11 @@ class TsvbCapturer(
         if (!hasLoggedFirstFrame) {
             hasLoggedFirstFrame = true
             Log.i(TAG, "First frame received: ${bitmap.width}x${bitmap.height}")
+            TsvbLogBridge.info(
+                TAG,
+                "First frame received",
+                mapOf("width" to bitmap.width, "height" to bitmap.height),
+            )
         }
 
         // Drop frame if previous conversion is still in progress (prevents backpressure lag)
@@ -189,6 +194,11 @@ class TsvbCapturer(
         stopFallbackCapturer()
 
         Log.d(TAG, "startCapture: ${width}x${height}@${fps}fps, device=$device")
+        TsvbLogBridge.info(
+            TAG,
+            "startCapture",
+            mapOf("width" to width, "height" to height, "fps" to fps, "device" to device),
+        )
 
         val pipeline = manager.getOrCreatePipeline(width, height, device)
         if (pipeline != null) {
@@ -197,11 +207,18 @@ class TsvbCapturer(
             if (!manager.isPipelineRunning) {
                 try {
                     Log.i(TAG, "Calling pipeline.startPipeline()")
+                    TsvbLogBridge.info(TAG, "Calling pipeline.startPipeline()")
                     pipeline.startPipeline()
                     manager.isPipelineRunning = true
                     Log.i(TAG, "Pipeline started (first time)")
+                    TsvbLogBridge.info(TAG, "Pipeline started (first time)")
                 } catch (e: Throwable) {
                     Log.e(TAG, "pipeline.startPipeline() threw — releasing and falling back", e)
+                    TsvbLogBridge.error(
+                        TAG,
+                        "pipeline.startPipeline() threw — releasing and falling back",
+                        e,
+                    )
                     pipeline.setOnFrameAvailableListener(null)
                     manager.releasePipeline()
                     isPipelineActive = false
@@ -216,8 +233,10 @@ class TsvbCapturer(
             isUsingFallback = false
             eventsHandler.onCameraOpening(device)
             Log.i(TAG, "onCameraOpening dispatched to LiveKit")
+            TsvbLogBridge.info(TAG, "onCameraOpening dispatched to LiveKit")
         } else {
             Log.e(TAG, "Effects SDK pipeline failed — falling back to standard camera")
+            TsvbLogBridge.warn(TAG, "Effects SDK pipeline failed — falling back to standard camera")
             isUsingFallback = true
             startFallbackCapturer(width, height, fps)
         }
@@ -320,12 +339,18 @@ class TsvbCapturer(
                 capturer.startCapture(width, height, fps)
                 fallbackCapturer = capturer
                 Log.w(TAG, "Fallback capturer started — camera works without effects")
+                TsvbLogBridge.warn(
+                    TAG,
+                    "Fallback capturer started — camera works without effects",
+                )
             } else {
                 Log.e(TAG, "Fallback capturer creation failed — camera unavailable")
+                TsvbLogBridge.error(TAG, "Fallback capturer creation failed — camera unavailable")
                 eventsHandler.onCameraError("Both Effects SDK and fallback camera failed")
             }
         } catch (e: Exception) {
             Log.e(TAG, "Fallback capturer exception", e)
+            TsvbLogBridge.error(TAG, "Fallback capturer exception", e)
             eventsHandler.onCameraError("Fallback camera failed: ${e.message}")
         }
     }

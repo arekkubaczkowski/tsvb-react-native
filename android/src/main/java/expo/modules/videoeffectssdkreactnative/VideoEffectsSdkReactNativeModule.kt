@@ -17,7 +17,17 @@ class VideoEffectsSdkReactNativeModule : Module() {
     override fun definition() = ModuleDefinition {
         Name("VideoEffectsSdkReactNativeModule")
 
-        Events("onFrameCaptured")
+        Events("onFrameCaptured", "onTsvbLog")
+
+        OnCreate {
+            TsvbLogBridge.setEmitter { payload ->
+                sendEvent("onTsvbLog", payload)
+            }
+        }
+
+        OnDestroy {
+            TsvbLogBridge.setEmitter(null)
+        }
 
         AsyncFunction("initialize") { customerID: String, trackId: String, promise: Promise ->
             tsvbManager.initialize(customerID, trackId) { result ->

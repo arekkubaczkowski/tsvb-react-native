@@ -95,6 +95,11 @@ class TsvbManager(private val context: Context) {
                             factoryRegistered = registerCapturerFactory()
                         }
                         Log.d(TAG, "Effects SDK initialized successfully, factory=$factoryRegistered")
+                        TsvbLogBridge.info(
+                            TAG,
+                            "Effects SDK initialized successfully",
+                            mapOf("factoryRegistered" to factoryRegistered),
+                        )
                         callback(mapOf(
                             "success" to true,
                             "status" to "active",
@@ -103,6 +108,12 @@ class TsvbManager(private val context: Context) {
                     }
                     else -> {
                         Log.e(TAG, "Effects SDK initialization failed: $status")
+                        TsvbLogBridge.error(
+                            TAG,
+                            "Effects SDK initialization failed",
+                            null,
+                            mapOf("status" to status.toString()),
+                        )
                         callback(mapOf("success" to false, "error" to "SDK status: $status"))
                     }
                 }
@@ -262,10 +273,16 @@ class TsvbManager(private val context: Context) {
 
             try {
                 Log.i(TAG, "Calling EffectsSDK.createSDKFactory()")
+                TsvbLogBridge.info(TAG, "Calling EffectsSDK.createSDKFactory()")
                 val factory = EffectsSDK.createSDKFactory()
                 val camera = detectCamera(cameraName)
                 val emptyBitmap = Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)
                 Log.i(TAG, "Calling factory.createCameraPipeline(${width}x${height}, camera=$camera)")
+                TsvbLogBridge.info(
+                    TAG,
+                    "Calling factory.createCameraPipeline",
+                    mapOf("width" to width, "height" to height, "camera" to camera.toString()),
+                )
                 val pipeline = factory.createCameraPipeline(
                     context,
                     optionsCache.pipelineMode,
@@ -287,9 +304,15 @@ class TsvbManager(private val context: Context) {
                 pipelineWidth = width
                 pipelineHeight = height
                 Log.i(TAG, "Created new pipeline: ${width}x${height}, camera=$camera")
+                TsvbLogBridge.info(
+                    TAG,
+                    "Created new pipeline",
+                    mapOf("width" to width, "height" to height, "camera" to camera.toString()),
+                )
                 return pipeline
             } catch (e: Throwable) {
                 Log.e(TAG, "Failed to create pipeline", e)
+                TsvbLogBridge.error(TAG, "Failed to create pipeline", e)
                 return null
             }
         }
@@ -355,6 +378,11 @@ class TsvbManager(private val context: Context) {
                     val eventsHandler = args[1] as org.webrtc.CameraVideoCapturer.CameraEventsHandler
                     val enumerator = args[2] as org.webrtc.CameraEnumerator
                     Log.d(TAG, "CapturerProvider creating TsvbCapturer for: $cameraName")
+                    TsvbLogBridge.info(
+                        TAG,
+                        "CapturerProvider creating TsvbCapturer",
+                        mapOf("cameraName" to cameraName),
+                    )
                     val capturer = TsvbCapturer(cameraName, eventsHandler, enumerator, this)
                     tsvbCapturer = capturer
                     applyFrameCaptureState(capturer)
@@ -367,9 +395,11 @@ class TsvbManager(private val context: Context) {
             val setFactoryMethod = providerClass.getMethod("setFactory", factoryInterface)
             setFactoryMethod.invoke(null, proxy)
             Log.d(TAG, "CapturerProvider factory registered")
+            TsvbLogBridge.info(TAG, "CapturerProvider factory registered")
             return true
         } catch (e: Exception) {
             Log.e(TAG, "Failed to register capturer factory — react-native-webrtc fork may not have CapturerProvider", e)
+            TsvbLogBridge.error(TAG, "Failed to register capturer factory", e)
             return false
         }
     }
