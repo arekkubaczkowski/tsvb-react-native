@@ -3,51 +3,48 @@ package expo.modules.videoeffectssdkreactnative
 /**
  * One-way native -> JS log forwarder.
  *
- * The module sets [emitter] in OnCreate; native classes call info/warn/error here
- * and the payload travels to JS as an `onTsvbLog` event. JS forwards it to its
- * own logger (DataDog in alpha/staging/prod, console in dev). Without this,
- * native logs only show up in adb logcat, which we can't access on remote
- * devices like alpha testers.
+ * The module sets [emitter] in OnCreate and toggles [jsListenerReady] via
+ * OnStartObserving / OnStopObserving. Events emitted before both are true
+ * (e.g. natively in module OnCreate, before JS has called addListener) would
+ * be dropped by Expo's sendEvent — so they are buffered here and flushed
+ * once both conditions are met. Without this, natively emitted diagnostics
+ * during startup never reach JS/DataDog.
  */
 object TsvbLogBridge {
     /** Prefix applied to every forwarded message so DataDog can filter on `message:tsvbNative.*`. */
     const val PREFIX = "tsvbNative."
 
-    /** Cap to prevent unbounded memory if emitter is never attached. */
-    private const val MAX_BUFFERED = 64
+    /** Cap to prevent unbounded memory if JS never subscribes. */
+    private const val MAX_BUFFERED = 128
 
     enum class Level { INFO, WARN, ERROR }
 
     @Volatile
     private var emitter: ((Map<String, Any?>) -> Unit)? = null
 
-    /** Events emitted before [setEmitter] is called are buffered here and flushed on attach. */
+    @Volatile
+    private var jsListenerReady = false
+
+    /** Events emitted before the bridge is fully wired (emitter + JS listener) are buffered here. */
     private val pending = ArrayDeque<Map<String, Any?>>()
     private val pendingLock = Any()
 
     fun setEmitter(emit: ((Map<String, Any?>) -> Unit)?) {
         emitter = emit
-        if (emit == null) return
-        val drained: List<Map<String, Any?>>
-        synchronized(pendingLock) {
-            drained = pending.toList()
-            pending.clear()
-        }
-        drained.forEach { payload ->
-            try {
-                emit(payload)
-            } catch (_: Throwable) {
-                // Don't let bridge errors crash native code
-            }
-        }
+        flushIfReady()
+    }
+
+    fun setJsListenerReady(ready: Boolean) {
+        jsListenerReady = ready
+        if (ready) flushIfReady()
     }
 
     fun info(tag: String, message: String, context: Map<String, Any?> = emptyMap()) {
-        emit(Level.INFO, tag, message, context, null)
+        enqueueOrEmit(Level.INFO, tag, message, context, null)
     }
 
     fun warn(tag: String, message: String, context: Map<String, Any?> = emptyMap()) {
-        emit(Level.WARN, tag, message, context, null)
+        enqueueOrEmit(Level.WARN, tag, message, context, null)
     }
 
     fun error(
@@ -56,17 +53,58 @@ object TsvbLogBridge {
         throwable: Throwable? = null,
         context: Map<String, Any?> = emptyMap(),
     ) {
-        emit(Level.ERROR, tag, message, context, throwable)
+        enqueueOrEmit(Level.ERROR, tag, message, context, throwable)
     }
 
-    private fun emit(
+    private fun enqueueOrEmit(
         level: Level,
         tag: String,
         message: String,
         context: Map<String, Any?>,
         throwable: Throwable?,
     ) {
-        val emit = emitter ?: return
+        val payload = buildPayload(level, tag, message, context, throwable)
+        val activeEmitter = emitter
+        if (activeEmitter != null && jsListenerReady) {
+            dispatch(activeEmitter, payload)
+            return
+        }
+        synchronized(pendingLock) {
+            pending.addLast(payload)
+            while (pending.size > MAX_BUFFERED) pending.removeFirst()
+        }
+    }
+
+    private fun flushIfReady() {
+        val activeEmitter = emitter ?: return
+        if (!jsListenerReady) return
+        val drained: List<Map<String, Any?>>
+        synchronized(pendingLock) {
+            if (pending.isEmpty()) return
+            drained = pending.toList()
+            pending.clear()
+        }
+        drained.forEach { dispatch(activeEmitter, it) }
+    }
+
+    private fun dispatch(
+        emit: (Map<String, Any?>) -> Unit,
+        payload: Map<String, Any?>,
+    ) {
+        try {
+            emit(payload)
+        } catch (_: Throwable) {
+            // Don't let bridge errors crash native code
+        }
+    }
+
+    private fun buildPayload(
+        level: Level,
+        tag: String,
+        message: String,
+        context: Map<String, Any?>,
+        throwable: Throwable?,
+    ): Map<String, Any?> {
         val payload = mutableMapOf<String, Any?>(
             "level" to level.name.lowercase(),
             "tag" to tag,
@@ -80,10 +118,6 @@ object TsvbLogBridge {
                 "stack" to throwable.stackTraceToString(),
             )
         }
-        try {
-            emit(payload)
-        } catch (_: Throwable) {
-            // Don't let bridge errors crash native code
-        }
+        return payload
     }
 }

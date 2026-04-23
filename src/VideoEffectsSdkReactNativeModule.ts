@@ -28,14 +28,27 @@ class TsvbVideoEffects {
   };
   private _subscribers = new Set<(event: EffectsEvent) => void>();
   private _frameCaptureSubscription: EventSubscription | null = null;
+  // Field exists solely to retain the subscription — Hermes can GC the
+  // callback in release builds if the EventSubscription object isn't held.
+  // @ts-expect-error -- intentionally unread; presence keeps the listener alive.
+  private readonly _nativeLogSubscription: EventSubscription;
+  // Pending log events received before any consumer subscribed.
+  // Native emits can fire during module OnCreate — earlier than the
+  // first `subscribe()` call — and would otherwise be lost. Capped to
+  // avoid unbounded growth if no consumer ever registers.
+  private _pendingLogEvents: Array<Extract<EffectsEvent, { type: "log" }>> = [];
+  private static readonly PENDING_LOG_CAP = 128;
 
   constructor() {
     // Permanent listener — native log events flow regardless of consumer subscriptions.
     // Forwarded to subscribers as { type: 'log', log: ... } so the app's logger can
     // pick them up and route to its own backend (DataDog, console, etc.).
-    VideoEffectsNativeModule.addListener("onTsvbLog", log => {
-      this.emit({ type: "log", log });
-    });
+    this._nativeLogSubscription = VideoEffectsNativeModule.addListener(
+      "onTsvbLog",
+      log => {
+        this.emit({ type: "log", log });
+      },
+    );
   }
 
   async initialize(config: EffectsConfig): Promise<InitializationResult> {
@@ -115,6 +128,19 @@ class TsvbVideoEffects {
 
   subscribe(callback: (event: EffectsEvent) => void): () => void {
     this._subscribers.add(callback);
+    // Replay any log events that arrived before this consumer subscribed,
+    // then drain the buffer so we don't replay them again to future consumers.
+    if (this._pendingLogEvents.length > 0) {
+      const drained = this._pendingLogEvents;
+      this._pendingLogEvents = [];
+      drained.forEach(event => {
+        try {
+          callback(event);
+        } catch {
+          // Don't let subscriber errors propagate
+        }
+      });
+    }
     return () => {
       this._subscribers.delete(callback);
     };
@@ -210,6 +236,13 @@ class TsvbVideoEffects {
   }
 
   private emit(event: EffectsEvent): void {
+    if (event.type === "log" && this._subscribers.size === 0) {
+      this._pendingLogEvents.push(event);
+      if (this._pendingLogEvents.length > TsvbVideoEffects.PENDING_LOG_CAP) {
+        this._pendingLogEvents.shift();
+      }
+      return;
+    }
     this._subscribers.forEach(cb => {
       try {
         cb(event);

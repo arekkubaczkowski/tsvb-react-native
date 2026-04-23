@@ -25,7 +25,16 @@ class VideoEffectsSdkReactNativeModule : Module() {
             }
         }
 
+        OnStartObserving("onTsvbLog") {
+            TsvbLogBridge.setJsListenerReady(true)
+        }
+
+        OnStopObserving("onTsvbLog") {
+            TsvbLogBridge.setJsListenerReady(false)
+        }
+
         OnDestroy {
+            TsvbLogBridge.setJsListenerReady(false)
             TsvbLogBridge.setEmitter(null)
         }
 
