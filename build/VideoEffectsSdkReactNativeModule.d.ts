@@ -5,6 +5,7 @@ declare class TsvbVideoEffects {
     private _state;
     private _subscribers;
     private _frameCaptureSubscription;
+    constructor();
     initialize(config: EffectsConfig): Promise<InitializationResult>;
     enableBlur(options?: BlurOptions): Promise<void>;
     enableReplaceBackground(options: ReplaceOptions): Promise<void>;

@@ -10,6 +10,14 @@ class TsvbVideoEffects {
     };
     _subscribers = new Set();
     _frameCaptureSubscription = null;
+    constructor() {
+        // Permanent listener — native log events flow regardless of consumer subscriptions.
+        // Forwarded to subscribers as { type: 'log', log: ... } so the app's logger can
+        // pick them up and route to its own backend (DataDog, console, etc.).
+        VideoEffectsNativeModule.addListener("onTsvbLog", log => {
+            this.emit({ type: "log", log });
+        });
+    }
     async initialize(config) {
         const { trackId } = config;
         try {
