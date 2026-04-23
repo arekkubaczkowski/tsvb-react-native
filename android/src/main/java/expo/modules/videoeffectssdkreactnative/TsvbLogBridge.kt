@@ -13,13 +13,33 @@ object TsvbLogBridge {
     /** Prefix applied to every forwarded message so DataDog can filter on `message:tsvbNative.*`. */
     const val PREFIX = "tsvbNative."
 
+    /** Cap to prevent unbounded memory if emitter is never attached. */
+    private const val MAX_BUFFERED = 64
+
     enum class Level { INFO, WARN, ERROR }
 
     @Volatile
     private var emitter: ((Map<String, Any?>) -> Unit)? = null
 
+    /** Events emitted before [setEmitter] is called are buffered here and flushed on attach. */
+    private val pending = ArrayDeque<Map<String, Any?>>()
+    private val pendingLock = Any()
+
     fun setEmitter(emit: ((Map<String, Any?>) -> Unit)?) {
         emitter = emit
+        if (emit == null) return
+        val drained: List<Map<String, Any?>>
+        synchronized(pendingLock) {
+            drained = pending.toList()
+            pending.clear()
+        }
+        drained.forEach { payload ->
+            try {
+                emit(payload)
+            } catch (_: Throwable) {
+                // Don't let bridge errors crash native code
+            }
+        }
     }
 
     fun info(tag: String, message: String, context: Map<String, Any?> = emptyMap()) {
