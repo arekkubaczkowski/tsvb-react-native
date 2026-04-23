@@ -29,12 +29,19 @@ class TsvbVideoEffects {
         });
     }
     async initialize(config) {
+        if (this._state.isEffectsUnavailable) {
+            throw new Error(this._state.error ?? "Effects SDK unavailable");
+        }
+        if (this._state.isInitialized) {
+            return { success: true, status: "already_initialized" };
+        }
         const { trackId } = config;
         try {
             const result = await VideoEffectsNativeModule.initialize(config.customerID, trackId);
             if (!result.success) {
-                this.updateState({ error: result.error || "Initialization failed" });
-                throw new Error(result.error || "Initialization failed");
+                const msg = result.error || "Initialization failed";
+                this.updateState({ error: msg, isEffectsUnavailable: true });
+                throw new Error(msg);
             }
             this.updateState({
                 isInitialized: true,
@@ -45,7 +52,9 @@ class TsvbVideoEffects {
         }
         catch (error) {
             const msg = `Failed to initialize TSVB SDK: ${error}`;
-            this.updateState({ error: msg });
+            if (!this._state.isEffectsUnavailable) {
+                this.updateState({ error: msg, isEffectsUnavailable: true });
+            }
             throw new Error(msg);
         }
     }
