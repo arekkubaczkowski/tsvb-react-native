@@ -235,7 +235,11 @@ class TsvbManager(private val context: Context) {
 
     /**
      * Returns existing pipeline or creates a new one if none exists.
-     * If pipeline already exists, it is reused. Resolution changes are applied via setResolution().
+     * Camera changes are NOT handled here — LiveKit dispatches them via the
+     * `WebRTCModule.switchCamera` bridge → `TsvbCapturer.switchCamera` →
+     * `manager.switchCamera` → `pipeline.switchCamera()` (in-place). Doing
+     * release+create here AND letting the bridge run in-place on the fresh
+     * pipeline produces GL thread chaos and `attachToGLContext` crashes.
      */
     fun getOrCreatePipeline(width: Int, height: Int, cameraName: String): CameraPipeline? {
         if (width <= 0 || height <= 0) {
@@ -243,10 +247,8 @@ class TsvbManager(private val context: Context) {
             return null
         }
         synchronized(lock) {
-            // Reuse existing pipeline
             val existing = cameraPipeline
             if (existing != null) {
-                // Update resolution if changed
                 if (width != pipelineWidth || height != pipelineHeight) {
                     existing.setResolution(Size(width, height))
                     pipelineWidth = width
@@ -258,7 +260,6 @@ class TsvbManager(private val context: Context) {
                 return existing
             }
 
-            // Create new pipeline
             try {
                 val factory = EffectsSDK.createSDKFactory()
                 val camera = detectCamera(cameraName)
@@ -304,27 +305,30 @@ class TsvbManager(private val context: Context) {
 
     /**
      * Called when a TsvbCapturer stops or is disposed.
-     * Stops the pipeline (without releasing it) so that the next
-     * startCapture() will call startPipeline() again.
+     * Detaches the frame listener so frames stop flowing to the dead capturer,
+     * but keeps the pipeline (and its GL thread) alive.
      *
-     * The pipeline object is kept alive to avoid SIGSEGV from
-     * rapid create/destroy, but the camera is stopped so it's
-     * not running in the background consuming resources.
+     * Why not stopPipeline(): MediaPipe's ExternalTextureConverter cannot
+     * survive stopPipeline → startPipeline cycles — the SurfaceTexture's GL
+     * context becomes invalid and `attachToGLContext` crashes on the second
+     * restart (FATAL EXCEPTION in GlThread). Keeping the GL thread alive and
+     * only swapping the listener avoids that. Pipeline is fully released
+     * via releasePipeline()/cleanup() only.
      */
     fun onCapturerStopped() {
+        synchronized(lock) {
+            cameraPipeline?.setOnFrameAvailableListener(null)
+            Log.d(TAG, "Pipeline listener detached (capturer stopped)")
+        }
+    }
+
+    /** Release pipeline fully — only called from cleanup. */
+    fun releasePipeline() {
         synchronized(lock) {
             if (isPipelineRunning) {
                 cameraPipeline?.stopPipeline()
                 isPipelineRunning = false
-                Log.d(TAG, "Pipeline stopped (capturer stopped/disposed)")
             }
-        }
-    }
-
-    /** Release pipeline fully — only called from dispose/cleanup. */
-    fun releasePipeline() {
-        synchronized(lock) {
-            onCapturerStopped()
             cameraPipeline?.release()
             cameraPipeline = null
             Log.d(TAG, "Pipeline released")
