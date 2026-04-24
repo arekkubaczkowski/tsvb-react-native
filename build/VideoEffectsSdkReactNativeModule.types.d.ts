@@ -32,20 +32,6 @@ export interface FrameCaptureEvent {
     /** Frame height in pixels */
     height: number;
 }
-export type NativeLogLevel = "info" | "warn" | "error";
-export interface NativeLogEvent {
-    level: NativeLogLevel;
-    /** Native logger tag (e.g. "TsvbCapturer", "TsvbManager") */
-    tag: string;
-    message: string;
-    context?: Record<string, unknown>;
-    /** Present when level === "error" and a Throwable was attached natively */
-    error?: {
-        name: string;
-        message: string;
-        stack: string;
-    };
-}
 export type EffectsEvent = {
     type: "stateChange";
     state: EffectsState;
@@ -56,9 +42,6 @@ export type EffectsEvent = {
 } | {
     type: "frameCaptured";
     frame: FrameCaptureEvent;
-} | {
-    type: "log";
-    log: NativeLogEvent;
 };
 export interface InitializationResult {
     success: boolean;
@@ -69,7 +52,6 @@ export interface InitializationResult {
 export type SegmentationPreset = "quality" | "balanced" | "speed" | "lightning";
 export type NativeModuleEventsMap = {
     onFrameCaptured(event: FrameCaptureEvent): void;
-    onTsvbLog(event: NativeLogEvent): void;
 };
 export interface NativeModuleInterface {
     initialize(customerID: string, trackId: string): Promise<InitializationResult>;

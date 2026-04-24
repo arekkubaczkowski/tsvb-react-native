@@ -70,15 +70,19 @@ class TsvbManager(private val context: Context) {
         captureWidth = width
         captureHeight = height
 
-        // Re-apply background if dimensions changed (orientation change)
+        // Re-apply background if dimensions changed (orientation change). Bitmap re-fit
+        // happens off the GL thread; the actual setBackground touches GL state and runs
+        // on the GL thread.
         if (changed && isReplaceBackgroundEnabled && originalBackgroundBitmap != null) {
             imageLoadExecutor.submit {
-                synchronized(lock) {
-                    val original = originalBackgroundBitmap ?: return@submit
-                    val fitted = centerCropAndResize(original, width, height)
-                    optionsCache.backgroundBitmap?.recycle()
-                    cameraPipeline?.setBackground(fitted)
-                    optionsCache.backgroundBitmap = fitted
+                val original = synchronized(lock) { originalBackgroundBitmap } ?: return@submit
+                val fitted = centerCropAndResize(original, width, height)
+                runOnGlThread {
+                    synchronized(lock) {
+                        optionsCache.backgroundBitmap?.recycle()
+                        cameraPipeline?.setBackground(fitted)
+                        optionsCache.backgroundBitmap = fitted
+                    }
                 }
             }
         }
@@ -104,11 +108,6 @@ class TsvbManager(private val context: Context) {
                             factoryRegistered = registerCapturerFactory()
                         }
                         Log.d(TAG, "Effects SDK initialized successfully, factory=$factoryRegistered")
-                        TsvbLogBridge.info(
-                            TAG,
-                            "Effects SDK initialized successfully",
-                            mapOf("factoryRegistered" to factoryRegistered),
-                        )
                         callback(mapOf(
                             "success" to true,
                             "status" to "active",
@@ -117,12 +116,6 @@ class TsvbManager(private val context: Context) {
                     }
                     else -> {
                         Log.e(TAG, "Effects SDK initialization failed: $status")
-                        TsvbLogBridge.error(
-                            TAG,
-                            "Effects SDK initialization failed",
-                            null,
-                            mapOf("status" to status.toString()),
-                        )
                         callback(mapOf("success" to false, "error" to "SDK status: $status"))
                     }
                 }
@@ -137,19 +130,24 @@ class TsvbManager(private val context: Context) {
 
     fun enableBlurBackground(power: Float, callback: (Map<String, Any>) -> Unit) {
         synchronized(lock) {
-            val pipeline = cameraPipeline
-            if (pipeline == null) {
+            if (cameraPipeline == null) {
                 callback(mapOf("success" to false, "error" to "Pipeline not created yet"))
                 return
             }
-
+            // Cache state synchronously so isBlurEnabled / optionsCache reflect the request
+            // immediately. Actual GL mutations are marshalled below.
+            optionsCache.pipelineMode = PipelineMode.BLUR
+            optionsCache.blurPower = power
+            isBlurEnabled = true
+            isReplaceBackgroundEnabled = false
+        }
+        runOnGlThread {
             try {
-                pipeline.setMode(PipelineMode.BLUR)
-                pipeline.setBlurPower(power)
-                optionsCache.pipelineMode = PipelineMode.BLUR
-                optionsCache.blurPower = power
-                isBlurEnabled = true
-                isReplaceBackgroundEnabled = false
+                synchronized(lock) {
+                    val pipeline = cameraPipeline ?: return@runOnGlThread
+                    pipeline.setMode(PipelineMode.BLUR)
+                    pipeline.setBlurPower(power)
+                }
                 callback(mapOf("success" to true))
             } catch (e: Exception) {
                 callback(mapOf("success" to false, "error" to e.message.orEmpty()))
@@ -159,17 +157,19 @@ class TsvbManager(private val context: Context) {
 
     fun disableBlurBackground(callback: (Map<String, Any>) -> Unit) {
         synchronized(lock) {
-            val pipeline = cameraPipeline
-            if (pipeline == null) {
+            if (cameraPipeline == null) {
                 callback(mapOf("success" to true))
                 return
             }
-
+            optionsCache.pipelineMode = PipelineMode.NO_EFFECT
+            isBlurEnabled = false
+            isReplaceBackgroundEnabled = false
+        }
+        runOnGlThread {
             try {
-                pipeline.setMode(PipelineMode.NO_EFFECT)
-                optionsCache.pipelineMode = PipelineMode.NO_EFFECT
-                isBlurEnabled = false
-                isReplaceBackgroundEnabled = false
+                synchronized(lock) {
+                    cameraPipeline?.setMode(PipelineMode.NO_EFFECT)
+                }
                 callback(mapOf("success" to true))
             } catch (e: Exception) {
                 callback(mapOf("success" to false, "error" to e.message.orEmpty()))
@@ -179,62 +179,63 @@ class TsvbManager(private val context: Context) {
 
     fun enableReplaceBackground(assetSource: Map<String, Any>?, callback: (Map<String, Any>) -> Unit) {
         synchronized(lock) {
-            val pipeline = cameraPipeline
-            if (pipeline == null) {
+            if (cameraPipeline == null) {
                 callback(mapOf("success" to false, "error" to "Pipeline not created yet"))
                 return
             }
-
+            optionsCache.pipelineMode = PipelineMode.REPLACE
+            isReplaceBackgroundEnabled = true
+            isBlurEnabled = false
+        }
+        runOnGlThread {
             try {
-                pipeline.setMode(PipelineMode.REPLACE)
-                optionsCache.pipelineMode = PipelineMode.REPLACE
-
-                // Load background image if provided
-                if (assetSource != null) {
-                    val uri = assetSource["uri"] as? String
-                    if (uri != null) {
-                        imageLoadExecutor.submit {
-                            try {
-                                val raw = loadBitmapFromUri(uri)
-                                if (raw != null) {
-                                    val targetW = if (captureWidth > 0) captureWidth else 720
-                                    val targetH = if (captureHeight > 0) captureHeight else 1280
-                                    val fitted = centerCropAndResize(raw, targetW, targetH)
-                                    synchronized(lock) {
-                                        originalBackgroundBitmap = raw  // keep original for re-apply on rotation
-                                        optionsCache.backgroundBitmap?.recycle()
-                                        cameraPipeline?.setBackground(fitted)
-                                        optionsCache.backgroundBitmap = fitted
-                                    }
-                                }
-                            } catch (e: Exception) {
-                                Log.e(TAG, "Failed to load background image", e)
-                            }
-                        }
-                    }
+                synchronized(lock) {
+                    cameraPipeline?.setMode(PipelineMode.REPLACE)
                 }
-
-                isReplaceBackgroundEnabled = true
-                isBlurEnabled = false
                 callback(mapOf("success" to true))
             } catch (e: Exception) {
                 callback(mapOf("success" to false, "error" to e.message.orEmpty()))
+                return@runOnGlThread
+            }
+
+            // Background loading happens off the GL thread; the actual setBackground call
+            // is marshalled back via runOnGlThread when the bitmap is ready.
+            val uri = (assetSource?.get("uri") as? String) ?: return@runOnGlThread
+            imageLoadExecutor.submit {
+                try {
+                    val raw = loadBitmapFromUri(uri) ?: return@submit
+                    val targetW = if (captureWidth > 0) captureWidth else 720
+                    val targetH = if (captureHeight > 0) captureHeight else 1280
+                    val fitted = centerCropAndResize(raw, targetW, targetH)
+                    runOnGlThread {
+                        synchronized(lock) {
+                            originalBackgroundBitmap = raw
+                            optionsCache.backgroundBitmap?.recycle()
+                            cameraPipeline?.setBackground(fitted)
+                            optionsCache.backgroundBitmap = fitted
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to load background image", e)
+                }
             }
         }
     }
 
     fun disableReplaceBackground(callback: (Map<String, Any>) -> Unit) {
         synchronized(lock) {
-            val pipeline = cameraPipeline
-            if (pipeline == null) {
+            if (cameraPipeline == null) {
                 callback(mapOf("success" to true))
                 return
             }
-
+            optionsCache.pipelineMode = PipelineMode.NO_EFFECT
+            isReplaceBackgroundEnabled = false
+        }
+        runOnGlThread {
             try {
-                pipeline.setMode(PipelineMode.NO_EFFECT)
-                optionsCache.pipelineMode = PipelineMode.NO_EFFECT
-                isReplaceBackgroundEnabled = false
+                synchronized(lock) {
+                    cameraPipeline?.setMode(PipelineMode.NO_EFFECT)
+                }
                 callback(mapOf("success" to true))
             } catch (e: Exception) {
                 callback(mapOf("success" to false, "error" to e.message.orEmpty()))
@@ -266,6 +267,13 @@ class TsvbManager(private val context: Context) {
             Log.e(TAG, "Invalid pipeline dimensions: ${width}x${height}")
             return null
         }
+        // Once we've fallen back this session, don't keep retrying SDK init on every
+        // restart — the SDK already declared itself unavailable. Only a fresh cleanup()
+        // can reset the fallback flag (clears tsvbCapturer reference).
+        if (tsvbCapturer?.isUsingFallback == true) {
+            Log.d(TAG, "Skipping pipeline create — capturer is already on fallback")
+            return null
+        }
         synchronized(lock) {
             val existing = cameraPipeline
             if (existing != null) {
@@ -282,16 +290,10 @@ class TsvbManager(private val context: Context) {
 
             try {
                 Log.i(TAG, "Calling EffectsSDK.createSDKFactory()")
-                TsvbLogBridge.info(TAG, "Calling EffectsSDK.createSDKFactory()")
                 val factory = EffectsSDK.createSDKFactory()
                 val camera = detectCamera(cameraName)
                 val emptyBitmap = Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)
                 Log.i(TAG, "Calling factory.createCameraPipeline(${width}x${height}, camera=$camera)")
-                TsvbLogBridge.info(
-                    TAG,
-                    "Calling factory.createCameraPipeline",
-                    mapOf("width" to width, "height" to height, "camera" to camera.toString()),
-                )
                 val pipeline = factory.createCameraPipeline(
                     context,
                     optionsCache.pipelineMode,
@@ -313,15 +315,9 @@ class TsvbManager(private val context: Context) {
                 pipelineWidth = width
                 pipelineHeight = height
                 Log.i(TAG, "Created new pipeline: ${width}x${height}, camera=$camera")
-                TsvbLogBridge.info(
-                    TAG,
-                    "Created new pipeline",
-                    mapOf("width" to width, "height" to height, "camera" to camera.toString()),
-                )
                 return pipeline
             } catch (e: Throwable) {
                 Log.e(TAG, "Failed to create pipeline", e)
-                TsvbLogBridge.error(TAG, "Failed to create pipeline", e)
                 return null
             }
         }
@@ -352,9 +348,13 @@ class TsvbManager(private val context: Context) {
      * via releasePipeline()/cleanup() only.
      */
     fun onCapturerStopped() {
-        synchronized(lock) {
-            cameraPipeline?.setOnFrameAvailableListener(null)
-            Log.d(TAG, "Pipeline listener detached (capturer stopped)")
+        // setOnFrameAvailableListener mutates SDK GL state — must run on the GL thread to
+        // stay consistent with startPipeline / setMode / switchCamera.
+        runOnGlThread {
+            synchronized(lock) {
+                cameraPipeline?.setOnFrameAvailableListener(null)
+                Log.d(TAG, "Pipeline listener detached (capturer stopped)")
+            }
         }
     }
 
@@ -375,12 +375,19 @@ class TsvbManager(private val context: Context) {
 
     /**
      * Run [block] on the GL thread (handler from SurfaceTextureHelper). Inline if already
-     * on that thread, post otherwise. Falls back to inline execution if no handler is set
-     * — happens before any TsvbCapturer ran initialize() (e.g. during early cleanup).
+     * on that thread, post otherwise. If no handler is set (e.g. early cleanup before any
+     * capturer attached) we run inline as a best-effort fallback and warn — the caller
+     * accepts that GL ops on the wrong thread may fail on strict drivers.
      */
     private fun runOnGlThread(block: () -> Unit) {
+        // Snapshot reference so a concurrent setter can't null it between the check and post.
         val handler = glHandler
-        if (handler == null || handler.looper.thread === Thread.currentThread()) {
+        if (handler == null) {
+            Log.w(TAG, "runOnGlThread: glHandler not set — running inline (no GL marshalling)")
+            block()
+            return
+        }
+        if (handler.looper.thread === Thread.currentThread()) {
             block()
             return
         }
@@ -405,11 +412,6 @@ class TsvbManager(private val context: Context) {
                     val eventsHandler = args[1] as org.webrtc.CameraVideoCapturer.CameraEventsHandler
                     val enumerator = args[2] as org.webrtc.CameraEnumerator
                     Log.d(TAG, "CapturerProvider creating TsvbCapturer for: $cameraName")
-                    TsvbLogBridge.info(
-                        TAG,
-                        "CapturerProvider creating TsvbCapturer",
-                        mapOf("cameraName" to cameraName),
-                    )
                     val capturer = TsvbCapturer(cameraName, eventsHandler, enumerator, this)
                     tsvbCapturer = capturer
                     applyFrameCaptureState(capturer)
@@ -422,11 +424,9 @@ class TsvbManager(private val context: Context) {
             val setFactoryMethod = providerClass.getMethod("setFactory", factoryInterface)
             setFactoryMethod.invoke(null, proxy)
             Log.d(TAG, "CapturerProvider factory registered")
-            TsvbLogBridge.info(TAG, "CapturerProvider factory registered")
             return true
         } catch (e: Exception) {
             Log.e(TAG, "Failed to register capturer factory — react-native-webrtc fork may not have CapturerProvider", e)
-            TsvbLogBridge.error(TAG, "Failed to register capturer factory", e)
             return false
         }
     }
@@ -494,6 +494,9 @@ class TsvbManager(private val context: Context) {
     fun cleanup() {
         imageLoadExecutor.shutdownNow()
         imageLoadExecutor = Executors.newSingleThreadExecutor()
+
+        // Drain capturer first so its (now-marshalled) onCapturerStopped can't race the
+        // pipeline release we're about to post. State flags are reset under lock.
         synchronized(lock) {
             frameCaptureCallback = null
             frameCaptureIntervalMs = 0
@@ -503,13 +506,16 @@ class TsvbManager(private val context: Context) {
             unregisterCapturerFactory()
             tsvbCapturer?.dispose()
             tsvbCapturer = null
-            releasePipeline()
             isInitialized = false
             isBlurEnabled = false
             isReplaceBackgroundEnabled = false
             originalBackgroundBitmap = null
             optionsCache.reset()
         }
+
+        // releasePipeline marshals onto the GL thread; outside the lock so we don't hold
+        // it across the post (avoids deadlock if the GL thread happens to need the lock).
+        releasePipeline()
     }
 
     // MARK: - Helpers
