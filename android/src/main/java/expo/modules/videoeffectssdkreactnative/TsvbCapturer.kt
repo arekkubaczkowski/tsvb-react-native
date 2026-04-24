@@ -285,6 +285,13 @@ class TsvbCapturer(
         fallbackCapturer?.dispose()
         fallbackCapturer = null
         capturerObserver = null
+        // Drop the manager's GL handler reference ONLY if it still points to OUR helper —
+        // a newer capturer may already have replaced it. Without this guard we would null
+        // the active GL thread and break the live capturer.
+        val ourHandler = surfaceTextureHelper?.handler
+        if (ourHandler != null && manager.glHandler === ourHandler) {
+            manager.glHandler = null
+        }
         surfaceTextureHelper = null
         context = null
     }

@@ -44,6 +44,9 @@ class TsvbManager(private val context: Context) {
 
     private val lock = Any()
     private var cameraPipeline: CameraPipeline? = null
+    // Read from the JS bridge thread (isEffectsUnavailable getter) and the WebRTC factory
+    // thread (createCapturer); written inside synchronized(lock) on factory invocations.
+    @Volatile
     private var tsvbCapturer: TsvbCapturer? = null
     private val optionsCache = EffectsSdkOptionsCache()
     private var imageLoadExecutor: ExecutorService = Executors.newSingleThreadExecutor()
@@ -141,10 +144,14 @@ class TsvbManager(private val context: Context) {
             isBlurEnabled = true
             isReplaceBackgroundEnabled = false
         }
-        runOnGlThread {
+        val posted = runOnGlThread {
+            val pipeline = synchronized(lock) { cameraPipeline }
+            if (pipeline == null) {
+                callback(mapOf("success" to false, "error" to "Pipeline disposed before GL mutation"))
+                return@runOnGlThread
+            }
             try {
                 synchronized(lock) {
-                    val pipeline = cameraPipeline ?: return@runOnGlThread
                     pipeline.setMode(PipelineMode.BLUR)
                     pipeline.setBlurPower(power)
                 }
@@ -152,6 +159,9 @@ class TsvbManager(private val context: Context) {
             } catch (e: Exception) {
                 callback(mapOf("success" to false, "error" to e.message.orEmpty()))
             }
+        }
+        if (!posted) {
+            callback(mapOf("success" to false, "error" to "GL thread unavailable"))
         }
     }
 
@@ -165,7 +175,7 @@ class TsvbManager(private val context: Context) {
             isBlurEnabled = false
             isReplaceBackgroundEnabled = false
         }
-        runOnGlThread {
+        val posted = runOnGlThread {
             try {
                 synchronized(lock) {
                     cameraPipeline?.setMode(PipelineMode.NO_EFFECT)
@@ -174,6 +184,9 @@ class TsvbManager(private val context: Context) {
             } catch (e: Exception) {
                 callback(mapOf("success" to false, "error" to e.message.orEmpty()))
             }
+        }
+        if (!posted) {
+            callback(mapOf("success" to false, "error" to "GL thread unavailable"))
         }
     }
 
@@ -187,7 +200,7 @@ class TsvbManager(private val context: Context) {
             isReplaceBackgroundEnabled = true
             isBlurEnabled = false
         }
-        runOnGlThread {
+        val posted = runOnGlThread {
             try {
                 synchronized(lock) {
                     cameraPipeline?.setMode(PipelineMode.REPLACE)
@@ -220,6 +233,9 @@ class TsvbManager(private val context: Context) {
                 }
             }
         }
+        if (!posted) {
+            callback(mapOf("success" to false, "error" to "GL thread unavailable"))
+        }
     }
 
     fun disableReplaceBackground(callback: (Map<String, Any>) -> Unit) {
@@ -231,7 +247,7 @@ class TsvbManager(private val context: Context) {
             optionsCache.pipelineMode = PipelineMode.NO_EFFECT
             isReplaceBackgroundEnabled = false
         }
-        runOnGlThread {
+        val posted = runOnGlThread {
             try {
                 synchronized(lock) {
                     cameraPipeline?.setMode(PipelineMode.NO_EFFECT)
@@ -240,6 +256,9 @@ class TsvbManager(private val context: Context) {
             } catch (e: Exception) {
                 callback(mapOf("success" to false, "error" to e.message.orEmpty()))
             }
+        }
+        if (!posted) {
+            callback(mapOf("success" to false, "error" to "GL thread unavailable"))
         }
     }
 
@@ -360,7 +379,7 @@ class TsvbManager(private val context: Context) {
 
     /** Release pipeline fully — only called from cleanup. Marshalled onto the GL thread. */
     fun releasePipeline() {
-        runOnGlThread {
+        val posted = runOnGlThread {
             synchronized(lock) {
                 if (isPipelineRunning) {
                     cameraPipeline?.stopPipeline()
@@ -371,27 +390,52 @@ class TsvbManager(private val context: Context) {
                 Log.d(TAG, "Pipeline released")
             }
         }
+        if (!posted) {
+            // GL handler is already gone (WebRTC tore down the SurfaceTextureHelper before
+            // we got here). Inline release will likely throw EGL errors but at least clears
+            // Java references so GC can reclaim them — better than a permanent leak.
+            Log.w(TAG, "Pipeline release: GL handler unavailable, attempting inline best-effort")
+            synchronized(lock) {
+                try {
+                    if (isPipelineRunning) {
+                        cameraPipeline?.stopPipeline()
+                        isPipelineRunning = false
+                    }
+                    cameraPipeline?.release()
+                } catch (e: Throwable) {
+                    Log.e(TAG, "Inline pipeline release failed (EGL likely torn down)", e)
+                } finally {
+                    cameraPipeline = null
+                }
+            }
+        }
     }
 
     /**
-     * Run [block] on the GL thread (handler from SurfaceTextureHelper). Inline if already
-     * on that thread, post otherwise. If no handler is set (e.g. early cleanup before any
-     * capturer attached) we run inline as a best-effort fallback and warn — the caller
-     * accepts that GL ops on the wrong thread may fail on strict drivers.
+     * Run [block] on the GL thread (handler from SurfaceTextureHelper). Returns true if
+     * the block was executed inline or successfully posted; false if no GL handler is set
+     * or the underlying Looper has quit. Callers with promise-bound callbacks must invoke
+     * a failure callback when this returns false to avoid hung JS Promises.
+     *
+     * Why no inline fallback: on strict drivers (Pixel 10 / Android 16) running pipeline
+     * ops without the EGL context current crashes with EGL_BAD_DISPLAY.
      */
-    private fun runOnGlThread(block: () -> Unit) {
+    private fun runOnGlThread(block: () -> Unit): Boolean {
         // Snapshot reference so a concurrent setter can't null it between the check and post.
         val handler = glHandler
         if (handler == null) {
-            Log.w(TAG, "runOnGlThread: glHandler not set — running inline (no GL marshalling)")
-            block()
-            return
+            Log.w(TAG, "runOnGlThread: glHandler not set — refusing inline run (EGL_BAD_DISPLAY risk)")
+            return false
         }
         if (handler.looper.thread === Thread.currentThread()) {
             block()
-            return
+            return true
         }
-        handler.post(block)
+        if (!handler.post(block)) {
+            Log.w(TAG, "runOnGlThread: handler.post returned false — Looper torn down")
+            return false
+        }
+        return true
     }
 
     // MARK: - Capturer Registration (via reflection to avoid compile-time dependency on fork)
@@ -413,7 +457,14 @@ class TsvbManager(private val context: Context) {
                     val enumerator = args[2] as org.webrtc.CameraEnumerator
                     Log.d(TAG, "CapturerProvider creating TsvbCapturer for: $cameraName")
                     val capturer = TsvbCapturer(cameraName, eventsHandler, enumerator, this)
-                    tsvbCapturer = capturer
+                    // Atomic swap-and-dispose under lock so a previous live capturer (e.g. mid
+                    // camera switch flow) is properly torn down instead of being clobbered.
+                    val previous = synchronized(lock) {
+                        val prev = tsvbCapturer
+                        tsvbCapturer = capturer
+                        prev
+                    }
+                    previous?.dispose()
                     applyFrameCaptureState(capturer)
                     capturer
                 } else {
@@ -495,8 +546,11 @@ class TsvbManager(private val context: Context) {
         imageLoadExecutor.shutdownNow()
         imageLoadExecutor = Executors.newSingleThreadExecutor()
 
-        // Drain capturer first so its (now-marshalled) onCapturerStopped can't race the
-        // pipeline release we're about to post. State flags are reset under lock.
+        // Release pipeline FIRST while the GL handler is still alive (TsvbCapturer.dispose
+        // nulls it). Outside the lock so we don't hold it across the post (avoids deadlock
+        // if the GL thread happens to need the lock).
+        releasePipeline()
+
         synchronized(lock) {
             frameCaptureCallback = null
             frameCaptureIntervalMs = 0
@@ -512,10 +566,6 @@ class TsvbManager(private val context: Context) {
             originalBackgroundBitmap = null
             optionsCache.reset()
         }
-
-        // releasePipeline marshals onto the GL thread; outside the lock so we don't hold
-        // it across the post (avoids deadlock if the GL thread happens to need the lock).
-        releasePipeline()
     }
 
     // MARK: - Helpers

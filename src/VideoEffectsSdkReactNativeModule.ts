@@ -158,8 +158,10 @@ class TsvbVideoEffects {
 
     try {
       VideoEffectsNativeModule.cleanup();
-    } catch {
-      // Ignore cleanup errors
+    } catch (error) {
+      // Surface to subscribers but don't throw — cleanup must always complete.
+      const msg = error instanceof Error ? error.message : String(error);
+      this.emitError(`TSVB native cleanup failed: ${msg}`, true);
     }
 
     this._state = {
