@@ -2,6 +2,7 @@ package expo.modules.videoeffectssdkreactnative
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.os.Handler
 import android.util.Log
 import android.util.Size
 import com.effectssdk.tsvb.Camera
@@ -46,6 +47,14 @@ class TsvbManager(private val context: Context) {
     private var tsvbCapturer: TsvbCapturer? = null
     private val optionsCache = EffectsSdkOptionsCache()
     private var imageLoadExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+
+    /**
+     * Handler bound to a thread that has a current EGL context (WebRTC's SurfaceTextureHelper
+     * thread). All TSVB pipeline lifecycle operations — createCameraPipeline, startPipeline,
+     * stopPipeline, release — must run here, otherwise the SDK's internal GL setup hits
+     * EGL_BAD_DISPLAY (no current display on a worker thread). Set by TsvbCapturer.initialize().
+     */
+    @Volatile var glHandler: Handler? = null
 
     // Camera capture dimensions — set from actual frame output
     @Volatile var captureWidth = 0
@@ -318,13 +327,15 @@ class TsvbManager(private val context: Context) {
         }
     }
 
-    /** Switch camera using SDK's built-in method — no pipeline recreate. */
+    /** Switch camera using SDK's built-in method — no pipeline recreate. Marshalled onto the GL thread. */
     fun switchCamera(cameraName: String) {
-        synchronized(lock) {
-            val pipeline = cameraPipeline ?: return
-            val camera = detectCamera(cameraName)
-            pipeline.switchCamera(camera)
-            Log.d(TAG, "Pipeline switchCamera to: $camera")
+        runOnGlThread {
+            synchronized(lock) {
+                val pipeline = cameraPipeline ?: return@runOnGlThread
+                val camera = detectCamera(cameraName)
+                pipeline.switchCamera(camera)
+                Log.d(TAG, "Pipeline switchCamera to: $camera")
+            }
         }
     }
 
@@ -347,17 +358,33 @@ class TsvbManager(private val context: Context) {
         }
     }
 
-    /** Release pipeline fully — only called from cleanup. */
+    /** Release pipeline fully — only called from cleanup. Marshalled onto the GL thread. */
     fun releasePipeline() {
-        synchronized(lock) {
-            if (isPipelineRunning) {
-                cameraPipeline?.stopPipeline()
-                isPipelineRunning = false
+        runOnGlThread {
+            synchronized(lock) {
+                if (isPipelineRunning) {
+                    cameraPipeline?.stopPipeline()
+                    isPipelineRunning = false
+                }
+                cameraPipeline?.release()
+                cameraPipeline = null
+                Log.d(TAG, "Pipeline released")
             }
-            cameraPipeline?.release()
-            cameraPipeline = null
-            Log.d(TAG, "Pipeline released")
         }
+    }
+
+    /**
+     * Run [block] on the GL thread (handler from SurfaceTextureHelper). Inline if already
+     * on that thread, post otherwise. Falls back to inline execution if no handler is set
+     * — happens before any TsvbCapturer ran initialize() (e.g. during early cleanup).
+     */
+    private fun runOnGlThread(block: () -> Unit) {
+        val handler = glHandler
+        if (handler == null || handler.looper.thread === Thread.currentThread()) {
+            block()
+            return
+        }
+        handler.post(block)
     }
 
     // MARK: - Capturer Registration (via reflection to avoid compile-time dependency on fork)

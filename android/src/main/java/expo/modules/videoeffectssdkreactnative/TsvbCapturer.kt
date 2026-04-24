@@ -182,6 +182,10 @@ class TsvbCapturer(
         this.surfaceTextureHelper = surfaceTextureHelper
         this.context = context
         this.capturerObserver = observer
+        // Hand the GL thread (where WebRTC made the shared EglBase context current) to the
+        // manager so all pipeline lifecycle ops happen there. Without this, TSVB's internal
+        // EGL setup hits EGL_BAD_DISPLAY on worker threads (Pixel 10 / Android 16).
+        manager.glHandler = surfaceTextureHelper?.handler
         Log.d(TAG, "Initialized with device: $device")
     }
 
@@ -200,46 +204,65 @@ class TsvbCapturer(
             mapOf("width" to width, "height" to height, "fps" to fps, "device" to device),
         )
 
+        // TSVB's createCameraPipeline / startPipeline allocate GL resources that require an
+        // EGL context current on the calling thread. The capturer is invoked from a worker
+        // thread with no EGL setup — running pipeline init there hits EGL_BAD_DISPLAY on
+        // strict drivers (e.g. Pixel 10 / Android 16). SurfaceTextureHelper's handler runs
+        // on a thread bound to WebRTC's shared EglBase context, so we marshal there.
+        val helper = surfaceTextureHelper
+        if (helper == null) {
+            Log.e(TAG, "startCapture: surfaceTextureHelper is null — using fallback capturer")
+            TsvbLogBridge.error(TAG, "startCapture: surfaceTextureHelper missing — using fallback")
+            isUsingFallback = true
+            startFallbackCapturer(width, height, fps)
+            return
+        }
+
+        helper.handler.post { startPipelineOnGlThread(width, height, fps) }
+    }
+
+    private fun startPipelineOnGlThread(width: Int, height: Int, fps: Int) {
         val pipeline = manager.getOrCreatePipeline(width, height, device)
-        if (pipeline != null) {
-            pipeline.setOnFrameAvailableListener(frameListener)
-            // Only call startPipeline on first creation — pipeline stays running across stop/start
-            if (!manager.isPipelineRunning) {
-                try {
-                    Log.i(TAG, "Calling pipeline.startPipeline()")
-                    TsvbLogBridge.info(TAG, "Calling pipeline.startPipeline()")
-                    pipeline.startPipeline()
-                    manager.isPipelineRunning = true
-                    Log.i(TAG, "Pipeline started (first time)")
-                    TsvbLogBridge.info(TAG, "Pipeline started (first time)")
-                } catch (e: Throwable) {
-                    Log.e(TAG, "pipeline.startPipeline() threw — releasing and falling back", e)
-                    TsvbLogBridge.error(
-                        TAG,
-                        "pipeline.startPipeline() threw — releasing and falling back",
-                        e,
-                    )
-                    pipeline.setOnFrameAvailableListener(null)
-                    manager.releasePipeline()
-                    isPipelineActive = false
-                    isUsingFallback = true
-                    startFallbackCapturer(width, height, fps)
-                    return
-                }
-            } else {
-                Log.d(TAG, "Pipeline already running, reattached listener")
-            }
-            isPipelineActive = true
-            isUsingFallback = false
-            eventsHandler.onCameraOpening(device)
-            Log.i(TAG, "onCameraOpening dispatched to LiveKit")
-            TsvbLogBridge.info(TAG, "onCameraOpening dispatched to LiveKit")
-        } else {
+        if (pipeline == null) {
             Log.e(TAG, "Effects SDK pipeline failed — falling back to standard camera")
             TsvbLogBridge.warn(TAG, "Effects SDK pipeline failed — falling back to standard camera")
             isUsingFallback = true
             startFallbackCapturer(width, height, fps)
+            return
         }
+
+        pipeline.setOnFrameAvailableListener(frameListener)
+        // Only call startPipeline on first creation — pipeline stays running across stop/start
+        if (!manager.isPipelineRunning) {
+            try {
+                Log.i(TAG, "Calling pipeline.startPipeline()")
+                TsvbLogBridge.info(TAG, "Calling pipeline.startPipeline()")
+                pipeline.startPipeline()
+                manager.isPipelineRunning = true
+                Log.i(TAG, "Pipeline started (first time)")
+                TsvbLogBridge.info(TAG, "Pipeline started (first time)")
+            } catch (e: Throwable) {
+                Log.e(TAG, "pipeline.startPipeline() threw — releasing and falling back", e)
+                TsvbLogBridge.error(
+                    TAG,
+                    "pipeline.startPipeline() threw — releasing and falling back",
+                    e,
+                )
+                pipeline.setOnFrameAvailableListener(null)
+                manager.releasePipeline()
+                isPipelineActive = false
+                isUsingFallback = true
+                startFallbackCapturer(width, height, fps)
+                return
+            }
+        } else {
+            Log.d(TAG, "Pipeline already running, reattached listener")
+        }
+        isPipelineActive = true
+        isUsingFallback = false
+        eventsHandler.onCameraOpening(device)
+        Log.i(TAG, "onCameraOpening dispatched to LiveKit")
+        TsvbLogBridge.info(TAG, "onCameraOpening dispatched to LiveKit")
     }
 
     override fun stopCapture() {
