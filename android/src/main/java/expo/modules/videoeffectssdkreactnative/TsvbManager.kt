@@ -2,16 +2,13 @@ package expo.modules.videoeffectssdkreactnative
 
 import android.content.Context
 import android.graphics.Bitmap
-import android.os.Handler
 import android.util.Log
 import android.util.Size
 import com.effectssdk.tsvb.Camera
 import com.effectssdk.tsvb.EffectsSDK
 import com.effectssdk.tsvb.EffectsSDKStatus
 import com.effectssdk.tsvb.pipeline.CameraPipeline
-import com.effectssdk.tsvb.pipeline.ColorCorrectionMode
 import com.effectssdk.tsvb.pipeline.PipelineMode
-import com.effectssdk.tsvb.pipeline.SegmentationMode
 import java.io.File
 import java.net.URL
 import java.util.concurrent.ExecutorService
@@ -19,7 +16,11 @@ import java.util.concurrent.Executors
 
 /**
  * Manages the Effects SDK lifecycle and CameraPipeline.
- * All pipeline mutations are synchronized via [lock].
+ *
+ * Threading: the SDK manages its own GL/EGL thread internally (since 2.14, via
+ * `createCameraPipelineAsync`). [lock] only guards OUR mutable state (cameraPipeline ref,
+ * dimensions, options cache, capturer ref) — pipeline method calls themselves run outside
+ * the lock to avoid deadlocking with frame-listener callbacks that re-enter our state.
  */
 class TsvbManager(private val context: Context) {
 
@@ -51,14 +52,6 @@ class TsvbManager(private val context: Context) {
     private val optionsCache = EffectsSdkOptionsCache()
     private var imageLoadExecutor: ExecutorService = Executors.newSingleThreadExecutor()
 
-    /**
-     * Handler bound to a thread that has a current EGL context (WebRTC's SurfaceTextureHelper
-     * thread). All TSVB pipeline lifecycle operations — createCameraPipeline, startPipeline,
-     * stopPipeline, release — must run here, otherwise the SDK's internal GL setup hits
-     * EGL_BAD_DISPLAY (no current display on a worker thread). Set by TsvbCapturer.initialize().
-     */
-    @Volatile var glHandler: Handler? = null
-
     // Camera capture dimensions — set from actual frame output
     @Volatile var captureWidth = 0
         private set
@@ -74,18 +67,16 @@ class TsvbManager(private val context: Context) {
         captureHeight = height
 
         // Re-apply background if dimensions changed (orientation change). Bitmap re-fit
-        // happens off the GL thread; the actual setBackground touches GL state and runs
-        // on the GL thread.
+        // happens on the executor; the actual setBackground call goes directly to the SDK
+        // which dispatches internally to its own GL thread.
         if (changed && isReplaceBackgroundEnabled && originalBackgroundBitmap != null) {
             imageLoadExecutor.submit {
                 val original = synchronized(lock) { originalBackgroundBitmap } ?: return@submit
                 val fitted = centerCropAndResize(original, width, height)
-                runOnGlThread {
-                    synchronized(lock) {
-                        optionsCache.backgroundBitmap?.recycle()
-                        cameraPipeline?.setBackground(fitted)
-                        optionsCache.backgroundBitmap = fitted
-                    }
+                synchronized(lock) {
+                    optionsCache.backgroundBitmap?.recycle()
+                    cameraPipeline?.setBackground(fitted)
+                    optionsCache.backgroundBitmap = fitted
                 }
             }
         }
@@ -132,133 +123,104 @@ class TsvbManager(private val context: Context) {
     // MARK: - Effects Control
 
     fun enableBlurBackground(power: Float, callback: (Map<String, Any>) -> Unit) {
-        synchronized(lock) {
-            if (cameraPipeline == null) {
+        val pipeline: CameraPipeline = synchronized(lock) {
+            val p = cameraPipeline
+            if (p == null) {
                 callback(mapOf("success" to false, "error" to "Pipeline not created yet"))
                 return
             }
-            // Cache state synchronously so isBlurEnabled / optionsCache reflect the request
-            // immediately. Actual GL mutations are marshalled below.
             optionsCache.pipelineMode = PipelineMode.BLUR
             optionsCache.blurPower = power
             isBlurEnabled = true
             isReplaceBackgroundEnabled = false
+            p
         }
-        val posted = runOnGlThread {
-            val pipeline = synchronized(lock) { cameraPipeline }
-            if (pipeline == null) {
-                callback(mapOf("success" to false, "error" to "Pipeline disposed before GL mutation"))
-                return@runOnGlThread
-            }
-            try {
-                synchronized(lock) {
-                    pipeline.setMode(PipelineMode.BLUR)
-                    pipeline.setBlurPower(power)
-                }
-                callback(mapOf("success" to true))
-            } catch (e: Exception) {
-                callback(mapOf("success" to false, "error" to e.message.orEmpty()))
-            }
-        }
-        if (!posted) {
-            callback(mapOf("success" to false, "error" to "GL thread unavailable"))
+        try {
+            pipeline.setMode(PipelineMode.BLUR)
+            pipeline.setBlurPower(power)
+            callback(mapOf("success" to true))
+        } catch (e: Exception) {
+            callback(mapOf("success" to false, "error" to e.message.orEmpty()))
         }
     }
 
     fun disableBlurBackground(callback: (Map<String, Any>) -> Unit) {
-        synchronized(lock) {
-            if (cameraPipeline == null) {
+        val pipeline: CameraPipeline = synchronized(lock) {
+            val p = cameraPipeline
+            if (p == null) {
                 callback(mapOf("success" to true))
                 return
             }
             optionsCache.pipelineMode = PipelineMode.NO_EFFECT
             isBlurEnabled = false
             isReplaceBackgroundEnabled = false
+            p
         }
-        val posted = runOnGlThread {
-            try {
-                synchronized(lock) {
-                    cameraPipeline?.setMode(PipelineMode.NO_EFFECT)
-                }
-                callback(mapOf("success" to true))
-            } catch (e: Exception) {
-                callback(mapOf("success" to false, "error" to e.message.orEmpty()))
-            }
-        }
-        if (!posted) {
-            callback(mapOf("success" to false, "error" to "GL thread unavailable"))
+        try {
+            pipeline.setMode(PipelineMode.NO_EFFECT)
+            callback(mapOf("success" to true))
+        } catch (e: Exception) {
+            callback(mapOf("success" to false, "error" to e.message.orEmpty()))
         }
     }
 
     fun enableReplaceBackground(assetSource: Map<String, Any>?, callback: (Map<String, Any>) -> Unit) {
-        synchronized(lock) {
-            if (cameraPipeline == null) {
+        val pipeline: CameraPipeline = synchronized(lock) {
+            val p = cameraPipeline
+            if (p == null) {
                 callback(mapOf("success" to false, "error" to "Pipeline not created yet"))
                 return
             }
             optionsCache.pipelineMode = PipelineMode.REPLACE
             isReplaceBackgroundEnabled = true
             isBlurEnabled = false
+            p
         }
-        val posted = runOnGlThread {
-            try {
-                synchronized(lock) {
-                    cameraPipeline?.setMode(PipelineMode.REPLACE)
-                }
-                callback(mapOf("success" to true))
-            } catch (e: Exception) {
-                callback(mapOf("success" to false, "error" to e.message.orEmpty()))
-                return@runOnGlThread
-            }
+        try {
+            pipeline.setMode(PipelineMode.REPLACE)
+            callback(mapOf("success" to true))
+        } catch (e: Exception) {
+            callback(mapOf("success" to false, "error" to e.message.orEmpty()))
+            return
+        }
 
-            // Background loading happens off the GL thread; the actual setBackground call
-            // is marshalled back via runOnGlThread when the bitmap is ready.
-            val uri = (assetSource?.get("uri") as? String) ?: return@runOnGlThread
-            imageLoadExecutor.submit {
-                try {
-                    val raw = loadBitmapFromUri(uri) ?: return@submit
-                    val targetW = if (captureWidth > 0) captureWidth else 720
-                    val targetH = if (captureHeight > 0) captureHeight else 1280
-                    val fitted = centerCropAndResize(raw, targetW, targetH)
-                    runOnGlThread {
-                        synchronized(lock) {
-                            originalBackgroundBitmap = raw
-                            optionsCache.backgroundBitmap?.recycle()
-                            cameraPipeline?.setBackground(fitted)
-                            optionsCache.backgroundBitmap = fitted
-                        }
-                    }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Failed to load background image", e)
+        // Background loading happens off the calling thread; the actual setBackground
+        // call goes directly to the SDK which dispatches to its own GL thread.
+        val uri = (assetSource?.get("uri") as? String) ?: return
+        imageLoadExecutor.submit {
+            try {
+                val raw = loadBitmapFromUri(uri) ?: return@submit
+                val targetW = if (captureWidth > 0) captureWidth else 720
+                val targetH = if (captureHeight > 0) captureHeight else 1280
+                val fitted = centerCropAndResize(raw, targetW, targetH)
+                synchronized(lock) {
+                    originalBackgroundBitmap = raw
+                    optionsCache.backgroundBitmap?.recycle()
+                    cameraPipeline?.setBackground(fitted)
+                    optionsCache.backgroundBitmap = fitted
                 }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to load background image", e)
             }
-        }
-        if (!posted) {
-            callback(mapOf("success" to false, "error" to "GL thread unavailable"))
         }
     }
 
     fun disableReplaceBackground(callback: (Map<String, Any>) -> Unit) {
-        synchronized(lock) {
-            if (cameraPipeline == null) {
+        val pipeline: CameraPipeline = synchronized(lock) {
+            val p = cameraPipeline
+            if (p == null) {
                 callback(mapOf("success" to true))
                 return
             }
             optionsCache.pipelineMode = PipelineMode.NO_EFFECT
             isReplaceBackgroundEnabled = false
+            p
         }
-        val posted = runOnGlThread {
-            try {
-                synchronized(lock) {
-                    cameraPipeline?.setMode(PipelineMode.NO_EFFECT)
-                }
-                callback(mapOf("success" to true))
-            } catch (e: Exception) {
-                callback(mapOf("success" to false, "error" to e.message.orEmpty()))
-            }
-        }
-        if (!posted) {
-            callback(mapOf("success" to false, "error" to "GL thread unavailable"))
+        try {
+            pipeline.setMode(PipelineMode.NO_EFFECT)
+            callback(mapOf("success" to true))
+        } catch (e: Exception) {
+            callback(mapOf("success" to false, "error" to e.message.orEmpty()))
         }
     }
 
@@ -274,25 +236,45 @@ class TsvbManager(private val context: Context) {
     private var pipelineHeight = 0
 
     /**
-     * Returns existing pipeline or creates a new one if none exists.
+     * Returns existing pipeline synchronously, or creates one ASYNCHRONOUSLY via
+     * `factory.createCameraPipelineAsync` and delivers it via [onReady]. Returning
+     * `null` from this function while invoking the callback later is intentional —
+     * callers MUST handle the callback path.
+     *
+     * Why async + no GL-thread marshalling: TSVB SDK 2.14+ provides
+     * `createCameraPipelineAsync` which runs all GL/Camera2 init on the SDK's own
+     * dedicated thread (with its own EGL context current). The earlier sync API
+     * required us to marshal onto WebRTC's `SurfaceTextureHelper.handler` to avoid
+     * `EGL_BAD_DISPLAY`, but that thread carries WebRTC's shared EGL context — wrong
+     * one for MediaPipe's needs. On a JOIN flow the WebRTC GL thread is also busy
+     * rendering remote frames, which adds queueing latency and exposes timing windows
+     * that silently break MediaPipe's frame-listener wiring (Pixel 10 / Android 16
+     * symptom: `startPipeline()` returns success but listener never fires).
+     *
      * Camera changes are NOT handled here — LiveKit dispatches them via the
      * `WebRTCModule.switchCamera` bridge → `TsvbCapturer.switchCamera` →
-     * `manager.switchCamera` → `pipeline.switchCamera()` (in-place). Doing
-     * release+create here AND letting the bridge run in-place on the fresh
-     * pipeline produces GL thread chaos and `attachToGLContext` crashes.
+     * `manager.switchCamera` → `pipeline.switchCamera()` (in-place).
      */
-    fun getOrCreatePipeline(width: Int, height: Int, cameraName: String): CameraPipeline? {
+    fun getOrCreatePipelineAsync(
+        width: Int,
+        height: Int,
+        cameraName: String,
+        onReady: (CameraPipeline?) -> Unit,
+    ) {
         if (width <= 0 || height <= 0) {
             Log.e(TAG, "Invalid pipeline dimensions: ${width}x${height}")
-            return null
+            onReady(null)
+            return
         }
         // Once we've fallen back this session, don't keep retrying SDK init on every
         // restart — the SDK already declared itself unavailable. Only a fresh cleanup()
         // can reset the fallback flag (clears tsvbCapturer reference).
         if (tsvbCapturer?.isUsingFallback == true) {
             Log.d(TAG, "Skipping pipeline create — capturer is already on fallback")
-            return null
+            onReady(null)
+            return
         }
+        // Fast path: existing pipeline can be reused without an async hop.
         synchronized(lock) {
             val existing = cameraPipeline
             if (existing != null) {
@@ -304,52 +286,85 @@ class TsvbManager(private val context: Context) {
                 } else {
                     Log.d(TAG, "Reusing existing pipeline")
                 }
-                return existing
+                onReady(existing)
+                return
             }
+        }
 
-            try {
-                Log.i(TAG, "Calling EffectsSDK.createSDKFactory()")
-                val factory = EffectsSDK.createSDKFactory()
-                val camera = detectCamera(cameraName)
-                val emptyBitmap = Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)
-                Log.i(TAG, "Calling factory.createCameraPipeline(${width}x${height}, camera=$camera)")
-                val pipeline = factory.createCameraPipeline(
-                    context,
-                    optionsCache.pipelineMode,
-                    SegmentationMode.AUTO,
-                    optionsCache.colorCorrectionMode,
-                    optionsCache.backgroundBitmap ?: emptyBitmap,
-                    optionsCache.colorGradingReference ?: emptyBitmap,
-                    0, // segmentationGap
-                    0, // faceDetectionGap
-                    optionsCache.blurPower,
-                    optionsCache.beautificationPower,
-                    optionsCache.isBeautificationEnabled,
-                    null, // FPSListener
-                    null, // OrientationChangeListener
-                    Size(width, height),
-                    camera
-                )
-                cameraPipeline = pipeline
-                pipelineWidth = width
-                pipelineHeight = height
-                Log.i(TAG, "Created new pipeline: ${width}x${height}, camera=$camera")
-                return pipeline
-            } catch (e: Throwable) {
-                Log.e(TAG, "Failed to create pipeline", e)
-                return null
+        try {
+            Log.i(TAG, "Calling EffectsSDK.createSDKFactory()")
+            val factory = EffectsSDK.createSDKFactory()
+            val camera = detectCamera(cameraName)
+            // Initial mode REPLACE (not NO_EFFECT) per EffectsSDK Flutter fork pattern —
+            // NO_EFFECT may skip spinning up the segmentation worker chain that drives
+            // the frame listener on some devices. Real options applied after pipeline ready.
+            val initialMode = if (optionsCache.pipelineMode == PipelineMode.NO_EFFECT) {
+                PipelineMode.REPLACE
+            } else {
+                optionsCache.pipelineMode
             }
+            Log.i(TAG, "Calling factory.createCameraPipelineAsync(${width}x${height}, camera=$camera, initialMode=$initialMode)")
+            factory.createCameraPipelineAsync(
+                context,
+                camera = camera,
+                resolution = Size(width, height),
+                mode = initialMode,
+            ) { pipeline ->
+                if (pipeline == null) {
+                    Log.e(TAG, "createCameraPipelineAsync returned null pipeline")
+                    onReady(null)
+                    return@createCameraPipelineAsync
+                }
+                synchronized(lock) {
+                    cameraPipeline = pipeline
+                    pipelineWidth = width
+                    pipelineHeight = height
+                }
+                // Apply options OUTSIDE the lock — SDK setters may dispatch internally,
+                // and the SDK's frame listener may already start firing and re-enter
+                // our lock via manager.setCaptureSize(). Holding the lock across SDK
+                // calls would deadlock.
+                applyCachedOptionsToPipeline(pipeline)
+                Log.i(TAG, "Created new pipeline (async): ${width}x${height}, camera=$camera")
+                onReady(pipeline)
+            }
+        } catch (e: Throwable) {
+            Log.e(TAG, "Failed to create pipeline (async)", e)
+            onReady(null)
         }
     }
 
-    /** Switch camera using SDK's built-in method — no pipeline recreate. Marshalled onto the GL thread. */
+    /**
+     * Applies cached pipeline options. Called once after async pipeline creation —
+     * the create call uses a default initial mode (REPLACE) so options must be
+     * synced afterward, including the user's intended `pipelineMode`.
+     */
+    private fun applyCachedOptionsToPipeline(pipeline: CameraPipeline) {
+        try {
+            pipeline.setMode(optionsCache.pipelineMode)
+            pipeline.setBlurPower(optionsCache.blurPower)
+            pipeline.setColorCorrectionMode(optionsCache.colorCorrectionMode)
+            pipeline.enableBeautification(optionsCache.isBeautificationEnabled)
+            pipeline.setBeautificationPower(optionsCache.beautificationPower)
+            optionsCache.backgroundBitmap?.let { pipeline.setBackground(it) }
+            optionsCache.colorGradingReference?.let {
+                pipeline.setColorGradingReferenceImage(it)
+            }
+        } catch (e: Throwable) {
+            Log.e(TAG, "Failed to apply cached options to pipeline", e)
+        }
+    }
+
+    /** Switch camera using SDK's built-in method — no pipeline recreate. SDK dispatches internally. */
     fun switchCamera(cameraName: String) {
-        runOnGlThread {
-            synchronized(lock) {
-                val pipeline = cameraPipeline ?: return@runOnGlThread
-                val camera = detectCamera(cameraName)
+        synchronized(lock) {
+            val pipeline = cameraPipeline ?: return
+            val camera = detectCamera(cameraName)
+            try {
                 pipeline.switchCamera(camera)
                 Log.d(TAG, "Pipeline switchCamera to: $camera")
+            } catch (e: Throwable) {
+                Log.e(TAG, "Pipeline switchCamera failed", e)
             }
         }
     }
@@ -357,85 +372,40 @@ class TsvbManager(private val context: Context) {
     /**
      * Called when a TsvbCapturer stops or is disposed.
      * Detaches the frame listener so frames stop flowing to the dead capturer,
-     * but keeps the pipeline (and its GL thread) alive.
+     * but keeps the pipeline alive (SDK manages its own GL thread internally).
      *
      * Why not stopPipeline(): MediaPipe's ExternalTextureConverter cannot
-     * survive stopPipeline → startPipeline cycles — the SurfaceTexture's GL
-     * context becomes invalid and `attachToGLContext` crashes on the second
-     * restart (FATAL EXCEPTION in GlThread). Keeping the GL thread alive and
-     * only swapping the listener avoids that. Pipeline is fully released
-     * via releasePipeline()/cleanup() only.
+     * survive stopPipeline → startPipeline cycles on some drivers (SurfaceTexture
+     * GL context becomes invalid, `attachToGLContext` crashes on second restart).
+     * Pipeline is fully released via releasePipeline()/cleanup() only.
      */
     fun onCapturerStopped() {
-        // setOnFrameAvailableListener mutates SDK GL state — must run on the GL thread to
-        // stay consistent with startPipeline / setMode / switchCamera.
-        runOnGlThread {
-            synchronized(lock) {
+        synchronized(lock) {
+            try {
                 cameraPipeline?.setOnFrameAvailableListener(null)
                 Log.d(TAG, "Pipeline listener detached (capturer stopped)")
+            } catch (e: Throwable) {
+                Log.w(TAG, "Failed to detach pipeline listener", e)
             }
         }
     }
 
-    /** Release pipeline fully — only called from cleanup. Marshalled onto the GL thread. */
+    /** Release pipeline fully — only called from cleanup. SDK dispatches GL ops internally. */
     fun releasePipeline() {
-        val posted = runOnGlThread {
-            synchronized(lock) {
+        synchronized(lock) {
+            try {
                 if (isPipelineRunning) {
                     cameraPipeline?.stopPipeline()
                     isPipelineRunning = false
                 }
                 cameraPipeline?.release()
-                cameraPipeline = null
                 Log.d(TAG, "Pipeline released")
+            } catch (e: Throwable) {
+                Log.e(TAG, "Pipeline release failed", e)
+            } finally {
+                cameraPipeline = null
             }
         }
-        if (!posted) {
-            // GL handler is already gone (WebRTC tore down the SurfaceTextureHelper before
-            // we got here). Inline release will likely throw EGL errors but at least clears
-            // Java references so GC can reclaim them — better than a permanent leak.
-            Log.w(TAG, "Pipeline release: GL handler unavailable, attempting inline best-effort")
-            synchronized(lock) {
-                try {
-                    if (isPipelineRunning) {
-                        cameraPipeline?.stopPipeline()
-                        isPipelineRunning = false
-                    }
-                    cameraPipeline?.release()
-                } catch (e: Throwable) {
-                    Log.e(TAG, "Inline pipeline release failed (EGL likely torn down)", e)
-                } finally {
-                    cameraPipeline = null
-                }
-            }
-        }
-    }
-
-    /**
-     * Run [block] on the GL thread (handler from SurfaceTextureHelper). Returns true if
-     * the block was executed inline or successfully posted; false if no GL handler is set
-     * or the underlying Looper has quit. Callers with promise-bound callbacks must invoke
-     * a failure callback when this returns false to avoid hung JS Promises.
-     *
-     * Why no inline fallback: on strict drivers (Pixel 10 / Android 16) running pipeline
-     * ops without the EGL context current crashes with EGL_BAD_DISPLAY.
-     */
-    private fun runOnGlThread(block: () -> Unit): Boolean {
-        // Snapshot reference so a concurrent setter can't null it between the check and post.
-        val handler = glHandler
-        if (handler == null) {
-            Log.w(TAG, "runOnGlThread: glHandler not set — refusing inline run (EGL_BAD_DISPLAY risk)")
-            return false
-        }
-        if (handler.looper.thread === Thread.currentThread()) {
-            block()
-            return true
-        }
-        if (!handler.post(block)) {
-            Log.w(TAG, "runOnGlThread: handler.post returned false — Looper torn down")
-            return false
-        }
-        return true
     }
 
     // MARK: - Capturer Registration (via reflection to avoid compile-time dependency on fork)
@@ -546,9 +516,8 @@ class TsvbManager(private val context: Context) {
         imageLoadExecutor.shutdownNow()
         imageLoadExecutor = Executors.newSingleThreadExecutor()
 
-        // Release pipeline FIRST while the GL handler is still alive (TsvbCapturer.dispose
-        // nulls it). Outside the lock so we don't hold it across the post (avoids deadlock
-        // if the GL thread happens to need the lock).
+        // Release pipeline first — SDK manages its own GL thread internally so this is
+        // safe to call from any thread regardless of capturer state.
         releasePipeline()
 
         synchronized(lock) {

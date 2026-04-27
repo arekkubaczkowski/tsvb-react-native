@@ -3,6 +3,7 @@ package expo.modules.videoeffectssdkreactnative
 import android.content.Context
 import android.graphics.Bitmap
 import android.util.Log
+import com.effectssdk.tsvb.pipeline.CameraPipeline
 import com.effectssdk.tsvb.pipeline.OnFrameAvailableListener
 import org.webrtc.CameraEnumerator
 import org.webrtc.CameraVideoCapturer
@@ -20,8 +21,11 @@ import java.util.concurrent.ExecutorService
  * via OnFrameAvailableListener.
  *
  * Threading:
- * - [capturerObserver] is set once during initialize() and never changes
- * - Pipeline callbacks arrive on the SDK's internal thread
+ * - [capturerObserver] is set once during initialize() and read on the SDK's frame-emit
+ *   thread (via frameListener) and on the SDK's pipeline-init thread (via onPipelineReady
+ *   async callback); volatile gives cross-thread visibility and lets us check for
+ *   "capturer disposed" inside the async callback.
+ * - Pipeline callbacks arrive on the SDK's internal thread (SDK manages its own GL thread)
  * - [isPipelineActive] is volatile for cross-thread visibility
  * - NV21 buffer is pre-allocated and reused (same resolution = same size)
  */
@@ -36,9 +40,9 @@ class TsvbCapturer(
         private const val TAG = "TsvbCapturer"
     }
 
-    // capturerObserver is read on the SDK's frame-emit thread (frameListener) and on the GL
-    // thread (startPipelineOnGlThread); volatile gives the necessary cross-thread visibility
-    // and lets us check for "capturer disposed" inside posted lambdas.
+    // capturerObserver is read on the SDK's frame-emit thread (frameListener) and on the
+    // SDK's pipeline-init thread (onPipelineReady callback); volatile gives the necessary
+    // cross-thread visibility and lets us check for "capturer disposed" inside the callback.
     @Volatile
     private var capturerObserver: CapturerObserver? = null
     private var surfaceTextureHelper: SurfaceTextureHelper? = null
@@ -185,10 +189,8 @@ class TsvbCapturer(
         this.surfaceTextureHelper = surfaceTextureHelper
         this.context = context
         this.capturerObserver = observer
-        // Hand the GL thread (where WebRTC made the shared EglBase context current) to the
-        // manager so all pipeline lifecycle ops happen there. Without this, TSVB's internal
-        // EGL setup hits EGL_BAD_DISPLAY on worker threads (Pixel 10 / Android 16).
-        manager.glHandler = surfaceTextureHelper?.handler
+        // Note: we no longer hand WebRTC's GL handler to TsvbManager — async SDK API
+        // manages its own GL/EGL thread internally.
         Log.d(TAG, "Initialized with device: $device")
     }
 
@@ -202,32 +204,26 @@ class TsvbCapturer(
 
         Log.d(TAG, "startCapture: ${width}x${height}@${fps}fps, device=$device")
 
-        // TSVB's createCameraPipeline / startPipeline allocate GL resources that require an
-        // EGL context current on the calling thread. The capturer is invoked from a worker
-        // thread with no EGL setup — running pipeline init there hits EGL_BAD_DISPLAY on
-        // strict drivers (e.g. Pixel 10 / Android 16). SurfaceTextureHelper's handler runs
-        // on a thread bound to WebRTC's shared EglBase context, so we marshal there.
-        val helper = surfaceTextureHelper
-        if (helper == null) {
-            Log.e(TAG, "startCapture: surfaceTextureHelper is null — using fallback capturer")
-            isUsingFallback = true
-            startFallbackCapturer(width, height, fps)
-            return
+        // No GL-thread marshalling — TSVB SDK 2.14+ `createCameraPipelineAsync` runs
+        // GL/Camera2 init on the SDK's own dedicated thread (its own EGL context current).
+        // Our previous workaround posted onto WebRTC's `SurfaceTextureHelper.handler`,
+        // which carries the WRONG EGL context (WebRTC's shared one, not MediaPipe's) and
+        // additionally gets queued behind remote-frame rendering on JOIN flows — exposing
+        // a timing window that silently breaks MediaPipe's frame-listener wiring on
+        // Pixel 10 / Android 16. Letting the SDK manage its own thread fixes both.
+        manager.getOrCreatePipelineAsync(width, height, device) { pipeline ->
+            onPipelineReady(pipeline, width, height, fps)
         }
-
-        helper.handler.post { startPipelineOnGlThread(width, height, fps) }
     }
 
-    private fun startPipelineOnGlThread(width: Int, height: Int, fps: Int) {
-        // Posted from startCapture() — by the time we run, dispose() may have nulled refs.
-        // Bail out instead of calling onCameraOpening() on a dead capturer (would desync
-        // WebRTC's state machine).
+    private fun onPipelineReady(pipeline: CameraPipeline?, width: Int, height: Int, fps: Int) {
+        // By the time the async callback fires, dispose() may have nulled refs.
+        // Bail out instead of calling onCameraOpening() on a dead capturer.
         if (capturerObserver == null) {
-            Log.w(TAG, "startPipelineOnGlThread: capturer disposed before pipeline init — skipping")
+            Log.w(TAG, "onPipelineReady: capturer disposed before pipeline init — skipping")
             return
         }
 
-        val pipeline = manager.getOrCreatePipeline(width, height, device)
         if (pipeline == null) {
             Log.e(TAG, "Effects SDK pipeline failed — falling back to standard camera")
             isUsingFallback = true
@@ -285,13 +281,6 @@ class TsvbCapturer(
         fallbackCapturer?.dispose()
         fallbackCapturer = null
         capturerObserver = null
-        // Drop the manager's GL handler reference ONLY if it still points to OUR helper —
-        // a newer capturer may already have replaced it. Without this guard we would null
-        // the active GL thread and break the live capturer.
-        val ourHandler = surfaceTextureHelper?.handler
-        if (ourHandler != null && manager.glHandler === ourHandler) {
-            manager.glHandler = null
-        }
         surfaceTextureHelper = null
         context = null
     }
