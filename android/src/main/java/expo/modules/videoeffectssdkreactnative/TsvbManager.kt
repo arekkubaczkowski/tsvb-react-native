@@ -318,9 +318,11 @@ class TsvbManager(private val context: Context) {
 
             Log.i(TAG, "Calling EffectsSDK.createSDKFactory()")
             val factory = EffectsSDK.createSDKFactory()
-            // Hijack SDK's internal ExecutorService so exceptions thrown by its async lambda
-            // are captured (default ThreadPoolExecutor SWALLOWS them — silent hang root cause).
-            hijackSdkFactoryExecutor(factory)
+            // Executor hijack DISABLED — previous data proved SDK doesn't throw silently
+            // (completed=1 in probe), and replacing the executor with daemon threads may
+            // alter MediaPipe worker thread inheritance in subtle ways. Kept the helper
+            // for opt-in diagnostic use if a different scenario needs it.
+            // hijackSdkFactoryExecutor(factory)
             val camera = detectCamera(cameraName)
             // Initial mode REPLACE (not NO_EFFECT) per EffectsSDK Flutter fork pattern —
             // NO_EFFECT may skip spinning up the segmentation worker chain that drives
