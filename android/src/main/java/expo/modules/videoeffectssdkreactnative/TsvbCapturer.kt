@@ -79,6 +79,14 @@ class TsvbCapturer(
     @Volatile
     private var hasLoggedFirstFrame = false
 
+    // Timestamp of last startCapture — used to compute elapsed time in pipeline-ready/stop logs
+    @Volatile
+    private var startCaptureAtMs: Long = 0
+
+    // First few "frame dropped because !isPipelineActive" hits — bounded to avoid log spam
+    @Volatile
+    private var inactiveDropLogsRemaining = 3
+
     // Frame capture
     @Volatile
     var isFrameCaptureEnabled = false
@@ -106,7 +114,13 @@ class TsvbCapturer(
 
     // Frame listener for CameraPipeline output
     private val frameListener = OnFrameAvailableListener { bitmap, timestamp ->
-        if (!isPipelineActive) return@OnFrameAvailableListener
+        if (!isPipelineActive) {
+            if (inactiveDropLogsRemaining > 0) {
+                inactiveDropLogsRemaining--
+                Log.w(TAG, "Frame dropped: pipeline not active (capturerObserver=${capturerObserver != null})")
+            }
+            return@OnFrameAvailableListener
+        }
         val observer = capturerObserver ?: return@OnFrameAvailableListener
 
         if (!hasLoggedFirstFrame) {
@@ -191,18 +205,28 @@ class TsvbCapturer(
         this.capturerObserver = observer
         // Note: we no longer hand WebRTC's GL handler to TsvbManager — async SDK API
         // manages its own GL/EGL thread internally.
-        Log.d(TAG, "Initialized with device: $device")
+        // DIAG: log WebRTC's GL handler thread — that's the thread that carries WebRTC's
+        // shared EGL context. If startCapture below ends up running on this thread on
+        // JOIN flow, it's a strong signal for the foreign-EGL hypothesis.
+        val sthThread = surfaceTextureHelper?.handler?.looper?.thread?.name
+        Log.d(TAG, "Initialized: device=$device, observer=${observer != null}, " +
+            "context=${context != null}, sthHandlerThread=$sthThread, " +
+            "callerThread=${Thread.currentThread().name}")
     }
 
     override fun startCapture(width: Int, height: Int, fps: Int) {
         currentWidth = width
         currentHeight = height
         currentFps = fps
+        startCaptureAtMs = System.currentTimeMillis()
+        hasLoggedFirstFrame = false
+        inactiveDropLogsRemaining = 3
 
         // Clean up previous fallback if any
         stopFallbackCapturer()
 
-        Log.d(TAG, "startCapture: ${width}x${height}@${fps}fps, device=$device")
+        Log.d(TAG, "startCapture: ${width}x${height}@${fps}fps, device=$device, " +
+            "callerThread=${Thread.currentThread().name}")
 
         // No GL-thread marshalling — TSVB SDK 2.14+ `createCameraPipelineAsync` runs
         // GL/Camera2 init on the SDK's own dedicated thread (its own EGL context current).
@@ -217,6 +241,10 @@ class TsvbCapturer(
     }
 
     private fun onPipelineReady(pipeline: CameraPipeline?, width: Int, height: Int, fps: Int) {
+        val elapsedMs = if (startCaptureAtMs > 0) System.currentTimeMillis() - startCaptureAtMs else -1
+        Log.i(TAG, "onPipelineReady: pipeline=${pipeline != null}, elapsedSinceStartCapture=${elapsedMs}ms, " +
+            "thread=${Thread.currentThread().name}")
+
         // By the time the async callback fires, dispose() may have nulled refs.
         // Bail out instead of calling onCameraOpening() on a dead capturer.
         if (capturerObserver == null) {
@@ -262,7 +290,9 @@ class TsvbCapturer(
     }
 
     override fun stopCapture() {
-        Log.d(TAG, "stopCapture")
+        val elapsedMs = if (startCaptureAtMs > 0) System.currentTimeMillis() - startCaptureAtMs else -1
+        Log.d(TAG, "stopCapture: elapsedSinceStart=${elapsedMs}ms, thread=${Thread.currentThread().name}, " +
+            "isPipelineActive=$isPipelineActive, hasLoggedFirstFrame=$hasLoggedFirstFrame")
         isPipelineActive = false
         manager.onCapturerStopped()
         stopFallbackCapturer()
@@ -275,7 +305,9 @@ class TsvbCapturer(
     }
 
     override fun dispose() {
-        Log.d(TAG, "dispose")
+        val elapsedMs = if (startCaptureAtMs > 0) System.currentTimeMillis() - startCaptureAtMs else -1
+        Log.d(TAG, "dispose: elapsedSinceStart=${elapsedMs}ms, thread=${Thread.currentThread().name}, " +
+            "isPipelineActive=$isPipelineActive, hasLoggedFirstFrame=$hasLoggedFirstFrame")
         isPipelineActive = false
         manager.onCapturerStopped()
         fallbackCapturer?.dispose()

@@ -14,10 +14,12 @@ class VideoEffectsSdkReactNativeModule : Module() {
     private val context: Context
         get() = appContext.reactContext ?: throw IllegalStateException("React context not available")
 
+    private var logcatScraper: LogcatErrorScraper? = null
+
     override fun definition() = ModuleDefinition {
         Name("VideoEffectsSdkReactNativeModule")
 
-        Events("onFrameCaptured")
+        Events("onFrameCaptured", "videoEffects.nativeError")
 
         AsyncFunction("initialize") { customerID: String, trackId: String, promise: Promise ->
             tsvbManager.initialize(customerID, trackId) { result ->
@@ -95,6 +97,59 @@ class VideoEffectsSdkReactNativeModule : Module() {
 
         Function("stopFrameCapture") {
             tsvbManager.stopFrameCapture()
+        }
+
+        Function("startNativeErrorScraper") {
+            if (logcatScraper == null) {
+                val scraper = LogcatErrorScraper { match ->
+                    sendEvent("videoEffects.nativeError", mapOf(
+                        "rawLine" to match.rawLine,
+                        "tag" to match.tag,
+                        "level" to match.level.toString(),
+                        "code" to (match.errorCode ?: ""),
+                        "pattern" to match.patternName,
+                        "pid" to match.pid,
+                        "tid" to match.tid,
+                        "timestampMs" to match.threadTimeMs,
+                        "message" to match.message,
+                    ))
+                }
+                logcatScraper = scraper
+                tsvbManager.attachLogcatScraper(scraper)
+                scraper.start()
+            } else {
+                logcatScraper?.resume()
+            }
+        }
+
+        Function("stopNativeErrorScraper") {
+            logcatScraper?.stop()
+            logcatScraper = null
+            tsvbManager.attachLogcatScraper(null)
+        }
+
+        Function("pauseNativeErrorScraper") {
+            logcatScraper?.pause()
+        }
+
+        Function("resumeNativeErrorScraper") {
+            logcatScraper?.resume()
+        }
+
+        Function("getNativeErrorRingBuffer") {
+            logcatScraper?.snapshot()?.map { match ->
+                mapOf(
+                    "rawLine" to match.rawLine,
+                    "tag" to match.tag,
+                    "level" to match.level.toString(),
+                    "code" to (match.errorCode ?: ""),
+                    "pattern" to match.patternName,
+                    "pid" to match.pid,
+                    "tid" to match.tid,
+                    "timestampMs" to match.threadTimeMs,
+                    "message" to match.message,
+                )
+            } ?: emptyList<Map<String, Any>>()
         }
     }
 }

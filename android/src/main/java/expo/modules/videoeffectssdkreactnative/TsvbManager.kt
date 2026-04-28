@@ -2,6 +2,9 @@ package expo.modules.videoeffectssdkreactnative
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.opengl.EGL14
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.util.Size
 import com.effectssdk.tsvb.Camera
@@ -13,6 +16,7 @@ import java.io.File
 import java.net.URL
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Manages the Effects SDK lifecycle and CameraPipeline.
@@ -44,6 +48,7 @@ class TsvbManager(private val context: Context) {
     @Volatile var isPipelineRunning = false
 
     private val lock = Any()
+    @Volatile private var logcatScraper: LogcatErrorScraper? = null
     private var cameraPipeline: CameraPipeline? = null
     // Read from the JS bridge thread (isEffectsUnavailable getter) and the WebRTC factory
     // thread (createCapturer); written inside synchronized(lock) on factory invocations.
@@ -100,6 +105,7 @@ class TsvbManager(private val context: Context) {
                         synchronized(lock) {
                             isInitialized = true
                             factoryRegistered = registerCapturerFactory()
+                            startInternalLogcatScraper()
                         }
                         Log.d(TAG, "Effects SDK initialized successfully, factory=$factoryRegistered")
                         callback(mapOf(
@@ -126,6 +132,10 @@ class TsvbManager(private val context: Context) {
         val pipeline: CameraPipeline = synchronized(lock) {
             val p = cameraPipeline
             if (p == null) {
+                Log.e(TAG, "enableBlur denied — pipeline null. " +
+                    "isInitialized=$isInitialized, sdkStatus=${EffectsSDK.getSdkStatus()}, " +
+                    "capturer=${tsvbCapturer != null}, isPipelineRunning=$isPipelineRunning, " +
+                    "fallback=${tsvbCapturer?.isUsingFallback}")
                 callback(mapOf("success" to false, "error" to "Pipeline not created yet"))
                 return
             }
@@ -168,6 +178,10 @@ class TsvbManager(private val context: Context) {
         val pipeline: CameraPipeline = synchronized(lock) {
             val p = cameraPipeline
             if (p == null) {
+                Log.e(TAG, "enableReplace denied — pipeline null. " +
+                    "isInitialized=$isInitialized, sdkStatus=${EffectsSDK.getSdkStatus()}, " +
+                    "capturer=${tsvbCapturer != null}, isPipelineRunning=$isPipelineRunning, " +
+                    "fallback=${tsvbCapturer?.isUsingFallback}")
                 callback(mapOf("success" to false, "error" to "Pipeline not created yet"))
                 return
             }
@@ -292,8 +306,21 @@ class TsvbManager(private val context: Context) {
         }
 
         try {
+            // DIAG: probe the calling thread's EGL state before SDK init — if a foreign
+            // EGL display/context is current here, MediaPipe's internal EglManager init
+            // may inherit it and silently fail with EGL_BAD_DISPLAY (suspected JOIN-flow root cause).
+            val callerThread = Thread.currentThread().name
+            val eglCtx = EGL14.eglGetCurrentContext()
+            val eglDisp = EGL14.eglGetCurrentDisplay()
+            Log.i(TAG, "Pre-create probe: thread=$callerThread, sdkStatus=${EffectsSDK.getSdkStatus()}, " +
+                "eglContext=$eglCtx (noContext=${eglCtx === EGL14.EGL_NO_CONTEXT}), " +
+                "eglDisplay=$eglDisp (noDisplay=${eglDisp === EGL14.EGL_NO_DISPLAY})")
+
             Log.i(TAG, "Calling EffectsSDK.createSDKFactory()")
             val factory = EffectsSDK.createSDKFactory()
+            // Hijack SDK's internal ExecutorService so exceptions thrown by its async lambda
+            // are captured (default ThreadPoolExecutor SWALLOWS them — silent hang root cause).
+            hijackSdkFactoryExecutor(factory)
             val camera = detectCamera(cameraName)
             // Initial mode REPLACE (not NO_EFFECT) per EffectsSDK Flutter fork pattern —
             // NO_EFFECT may skip spinning up the segmentation worker chain that drives
@@ -303,6 +330,40 @@ class TsvbManager(private val context: Context) {
             } else {
                 optionsCache.pipelineMode
             }
+
+            // Watchdog + auto-fallback: SDK has no error callback — silent hang is the only failure mode.
+            // 5s logs diagnostics. 7s probes SDK internals via reflection. 10s gives up and triggers
+            // fallback (onReady(null) → TsvbCapturer.startFallbackCapturer → standard Camera2 without effects).
+            // Atomic flips prevent the SDK callback (if it eventually arrives late) from racing with fallback.
+            val callbackFired = AtomicBoolean(false)
+            val startedAtMs = System.currentTimeMillis()
+            val watchdog = Handler(Looper.getMainLooper())
+            val watchdog5s = Runnable {
+                if (!callbackFired.get()) {
+                    val pipelineNull = synchronized(lock) { cameraPipeline == null }
+                    Log.e(TAG, "ASYNC WATCHDOG 5s: callback NOT received. " +
+                        "callerThread=$callerThread, sdkStatus=${EffectsSDK.getSdkStatus()}, " +
+                        "pipelineFieldNull=$pipelineNull")
+                    dumpScraperRingBuffer(reason = "watchdog_5s", elapsedMs = 5000L)
+                }
+            }
+            val watchdog7sProbe = Runnable {
+                if (!callbackFired.get()) {
+                    probeStuckSdkState(factory)
+                }
+            }
+            val watchdog10sFallback = Runnable {
+                if (callbackFired.compareAndSet(false, true)) {
+                    val elapsedMs = System.currentTimeMillis() - startedAtMs
+                    Log.e(TAG, "ASYNC WATCHDOG 10s: triggering FALLBACK after ${elapsedMs}ms — TSVB SDK silent hang")
+                    dumpScraperRingBuffer(reason = "watchdog_10s_fallback", elapsedMs = elapsedMs)
+                    onReady(null)
+                }
+            }
+            watchdog.postDelayed(watchdog5s, 5000)
+            watchdog.postDelayed(watchdog7sProbe, 7000)
+            watchdog.postDelayed(watchdog10sFallback, 10000)
+
             Log.i(TAG, "Calling factory.createCameraPipelineAsync(${width}x${height}, camera=$camera, initialMode=$initialMode)")
             factory.createCameraPipelineAsync(
                 context,
@@ -310,6 +371,18 @@ class TsvbManager(private val context: Context) {
                 resolution = Size(width, height),
                 mode = initialMode,
             ) { pipeline ->
+                if (!callbackFired.compareAndSet(false, true)) {
+                    Log.w(TAG, "createCameraPipelineAsync callback fired AFTER fallback timeout — releasing late pipeline")
+                    try { pipeline?.release() } catch (_: Throwable) {}
+                    return@createCameraPipelineAsync
+                }
+                watchdog.removeCallbacks(watchdog5s)
+                watchdog.removeCallbacks(watchdog7sProbe)
+                watchdog.removeCallbacks(watchdog10sFallback)
+                val elapsedMs = System.currentTimeMillis() - startedAtMs
+                Log.i(TAG, "createCameraPipelineAsync callback fired after ${elapsedMs}ms, " +
+                    "pipeline=${pipeline != null}, callbackThread=${Thread.currentThread().name}")
+
                 if (pipeline == null) {
                     Log.e(TAG, "createCameraPipelineAsync returned null pipeline")
                     onReady(null)
@@ -320,6 +393,9 @@ class TsvbManager(private val context: Context) {
                     pipelineWidth = width
                     pipelineHeight = height
                 }
+                // Install our own MediaPipe FrameProcessor error listener via reflection —
+                // SDK installs one that only logs to logcat. Ours surfaces to our Logger.
+                installFrameProcessorErrorListener(pipeline)
                 // Apply options OUTSIDE the lock — SDK setters may dispatch internally,
                 // and the SDK's frame listener may already start firing and re-enter
                 // our lock via manager.setCaptureSize(). Holding the lock across SDK
@@ -328,9 +404,185 @@ class TsvbManager(private val context: Context) {
                 Log.i(TAG, "Created new pipeline (async): ${width}x${height}, camera=$camera")
                 onReady(pipeline)
             }
+            // Confirms the SDK call site itself returned synchronously (queued the work)
+            // — distinguishes "stuck inside createCameraPipelineAsync" from "queued OK, callback never fires".
+            Log.i(TAG, "createCameraPipelineAsync invocation returned synchronously after ${System.currentTimeMillis() - startedAtMs}ms")
         } catch (e: Throwable) {
-            Log.e(TAG, "Failed to create pipeline (async)", e)
+            Log.e(TAG, "Failed to create pipeline (async) — sdkStatus=${EffectsSDK.getSdkStatus()}", e)
             onReady(null)
+        }
+    }
+
+    /**
+     * Diagnostic probe — fired at 7s when async callback hasn't returned yet.
+     * Pipeline reference is unavailable (callback never fired), so we probe what we can:
+     * - SDK status + factory's executor state (queued tasks, alive workers)
+     * - Process-wide EGL state from a freshly spawned thread (rules out caller-thread-only contamination)
+     * - Stack traces of all threads that look TSVB/MediaPipe related — reveals where SDK executor is stuck.
+     */
+    private fun probeStuckSdkState(factory: Any) {
+        try {
+            Log.e(TAG, "PROBE 7s: sdkStatus=${EffectsSDK.getSdkStatus()}, " +
+                "factory=${factory.javaClass.name}@${System.identityHashCode(factory)}")
+
+            // Probe SDKFactoryImpl.executor via reflection — is the queue blocked?
+            try {
+                val execField = factory.javaClass.declaredFields.firstOrNull { it.type.name.contains("Executor", ignoreCase = true) }
+                execField?.isAccessible = true
+                val executor = execField?.get(factory)
+                if (executor is java.util.concurrent.ThreadPoolExecutor) {
+                    Log.e(TAG, "PROBE 7s: factory.executor pool=${executor.poolSize}, " +
+                        "active=${executor.activeCount}, queue=${executor.queue.size}, " +
+                        "completed=${executor.completedTaskCount}, isShutdown=${executor.isShutdown}")
+                } else {
+                    Log.e(TAG, "PROBE 7s: factory.executor=$executor (not ThreadPoolExecutor — cannot introspect)")
+                }
+            } catch (e: Throwable) {
+                Log.w(TAG, "PROBE 7s: executor reflection failed", e)
+            }
+
+            // Process-wide EGL probe from a fresh thread — if EGL is corrupted process-wide,
+            // a fresh thread's eglGetDisplay also fails. If only SDK thread is stuck, fresh thread is OK.
+            val probeThread = Thread({
+                val freshDisp = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
+                val freshErr = EGL14.eglGetError()
+                Log.e(TAG, "PROBE 7s: fresh-thread eglGetDisplay=$freshDisp " +
+                    "(noDisplay=${freshDisp === EGL14.EGL_NO_DISPLAY}), eglGetError=0x${freshErr.toString(16)}")
+            }, "TsvbEglProbe").apply { isDaemon = true }
+            probeThread.start()
+
+            // Thread dump — find threads that look TSVB/MediaPipe related, log their stack
+            val relevantThreads = Thread.getAllStackTraces()
+                .filterKeys { thread ->
+                    val name = thread.name.lowercase()
+                    name.contains("pipeline") || name.contains("mediapipe") || name.contains("egl") ||
+                        name.contains("effectssdk") || name.contains("gl-thread") ||
+                        Regex("pool-\\d+-thread").containsMatchIn(name)
+                }
+            if (relevantThreads.isEmpty()) {
+                Log.e(TAG, "PROBE 7s: no threads matched (pipeline|mediapipe|egl|effectssdk|gl-thread|pool-N) — " +
+                    "SDK may not have spawned its worker yet")
+            } else {
+                relevantThreads.forEach { (thread, frames) ->
+                    val topFrames = frames.take(15).joinToString("\n  at ", prefix = "  at ")
+                    Log.e(TAG, "PROBE 7s: thread '${thread.name}' state=${thread.state}\n$topFrames")
+                }
+            }
+        } catch (e: Throwable) {
+            Log.e(TAG, "PROBE 7s: probe itself failed", e)
+        }
+    }
+
+    /**
+     * Replaces SDKFactoryImpl's internal `executor` (private final ExecutorService)
+     * with our own ThreadPoolExecutor that has an UncaughtExceptionHandler + afterExecute hook.
+     *
+     * Why: per AAR decompile, SDKFactoryImpl uses `Executors.newSingleThreadExecutor()` with
+     * NO exception handling. The lambda passed to `createCameraPipelineAsync` constructs
+     * `CameraPipelineImpl` (which can throw EGL/native init errors). When it throws, the
+     * default ThreadPoolExecutor catches it inside FutureTask.run() and the worker dies
+     * silently — our user callback is never invoked. This is THE silent-hang failure mode.
+     *
+     * After this hijack, those swallowed exceptions land in our logger.
+     * Returns true on success, false if reflection failed (SDK upgrade etc.).
+     */
+    private fun hijackSdkFactoryExecutor(factory: Any): Boolean {
+        return try {
+            val execField = factory.javaClass.declaredFields.firstOrNull {
+                it.type == java.util.concurrent.ExecutorService::class.java ||
+                    it.type.name.contains("Executor", ignoreCase = true)
+            } ?: run {
+                Log.w(TAG, "Executor hijack: no executor field found on ${factory.javaClass.name}")
+                return false
+            }
+            execField.isAccessible = true
+            val original = execField.get(factory) as? java.util.concurrent.ExecutorService
+            if (original == null) {
+                Log.w(TAG, "Executor hijack: field present but null/unexpected type")
+                return false
+            }
+
+            val replacement = object : java.util.concurrent.ThreadPoolExecutor(
+                1, 1, 0L, java.util.concurrent.TimeUnit.MILLISECONDS,
+                java.util.concurrent.LinkedBlockingQueue(),
+                java.util.concurrent.ThreadFactory { r ->
+                    Thread(r, "TsvbSdkExecutor-hijacked").apply {
+                        isDaemon = true
+                        uncaughtExceptionHandler = Thread.UncaughtExceptionHandler { thread, ex ->
+                            Log.e(TAG, "SDK_EXEC_UNCAUGHT on '${thread.name}': ${ex.javaClass.name}: ${ex.message}", ex)
+                            var cause: Throwable? = ex.cause
+                            while (cause != null) {
+                                Log.e(TAG, "  caused by ${cause.javaClass.name}: ${cause.message}", cause)
+                                cause = cause.cause
+                            }
+                        }
+                    }
+                },
+            ) {
+                override fun afterExecute(r: Runnable, t: Throwable?) {
+                    super.afterExecute(r, t)
+                    if (t != null) {
+                        Log.e(TAG, "SDK_EXEC_TASK_THREW: ${t.javaClass.name}: ${t.message}", t)
+                        var cause: Throwable? = t.cause
+                        while (cause != null) {
+                            Log.e(TAG, "  caused by ${cause.javaClass.name}: ${cause.message}", cause)
+                            cause = cause.cause
+                        }
+                    }
+                }
+            }
+            execField.set(factory, replacement)
+            // Don't shutdown original — its FinalizableDelegatedExecutorService wrapper hangs
+            // waiting on workers. Just orphan it; daemon thread will die on JVM exit.
+            Log.i(TAG, "Executor hijack: SDK executor replaced with logging variant")
+            true
+        } catch (e: Throwable) {
+            Log.w(TAG, "Executor hijack failed — silent SDK exceptions will remain invisible", e)
+            false
+        }
+    }
+
+    /**
+     * Replaces the SDK's MediaPipe FrameProcessor.setAsynchronousErrorListener with one that
+     * surfaces RuntimeExceptions to our Logger. SDK's installed listener (PipelineCore.initPipeline$lambda$1)
+     * just does `Log.w("EffectsSDK", e.message)` and drops the exception.
+     *
+     * This catches RUNTIME errors (during graph execution) — not init errors (those happen
+     * before this listener is reachable; see hijackSdkFactoryExecutor for those).
+     *
+     * Reflection path (verified against AAR 2.14.0):
+     *   CameraPipelineImpl.core (private PipelineCore)
+     *     → PipelineCore.getFrameProcessor() (PUBLIC, returns MediaPipe FrameProcessor)
+     *       → setAsynchronousErrorListener(ErrorListener, Handler)
+     */
+    private fun installFrameProcessorErrorListener(pipeline: CameraPipeline) {
+        try {
+            val coreField = pipeline.javaClass.getDeclaredField("core").apply { isAccessible = true }
+            val core = coreField.get(pipeline) ?: return
+            val processor = core.javaClass.getMethod("getFrameProcessor").invoke(core) ?: return
+
+            val listenerCls = Class.forName(
+                "com.google.mediapipe.components.FrameProcessor\$ErrorListener",
+                true, processor.javaClass.classLoader,
+            )
+            val proxy = java.lang.reflect.Proxy.newProxyInstance(
+                listenerCls.classLoader, arrayOf(listenerCls),
+            ) { _, method, args ->
+                if (method.name == "onError" && args != null && args.isNotEmpty()) {
+                    val t = args[0] as? Throwable
+                    if (t != null) {
+                        Log.e(TAG, "MEDIAPIPE_RUNTIME_ERROR: ${t.javaClass.name}: ${t.message}", t)
+                    }
+                }
+                null
+            }
+            val setter = processor.javaClass.getMethod(
+                "setAsynchronousErrorListener", listenerCls, Handler::class.java,
+            )
+            setter.invoke(processor, proxy, Handler(Looper.getMainLooper()))
+            Log.i(TAG, "Installed MediaPipe FrameProcessor ErrorListener via reflection")
+        } catch (e: Throwable) {
+            Log.w(TAG, "FrameProcessor listener reflection failed (SDK upgrade?) — runtime errors silent", e)
         }
     }
 
@@ -383,7 +635,7 @@ class TsvbManager(private val context: Context) {
         synchronized(lock) {
             try {
                 cameraPipeline?.setOnFrameAvailableListener(null)
-                Log.d(TAG, "Pipeline listener detached (capturer stopped)")
+                Log.d(TAG, "Pipeline listener detached (capturer stopped) on thread=${Thread.currentThread().name}")
             } catch (e: Throwable) {
                 Log.w(TAG, "Failed to detach pipeline listener", e)
             }
@@ -393,6 +645,9 @@ class TsvbManager(private val context: Context) {
     /** Release pipeline fully — only called from cleanup. SDK dispatches GL ops internally. */
     fun releasePipeline() {
         synchronized(lock) {
+            val hadPipeline = cameraPipeline != null
+            Log.d(TAG, "releasePipeline: hadPipeline=$hadPipeline, isPipelineRunning=$isPipelineRunning, " +
+                "thread=${Thread.currentThread().name}")
             try {
                 if (isPipelineRunning) {
                     cameraPipeline?.stopPipeline()
@@ -513,6 +768,8 @@ class TsvbManager(private val context: Context) {
     // MARK: - Cleanup
 
     fun cleanup() {
+        Log.d(TAG, "cleanup: thread=${Thread.currentThread().name}")
+        stopInternalLogcatScraper()
         imageLoadExecutor.shutdownNow()
         imageLoadExecutor = Executors.newSingleThreadExecutor()
 
@@ -593,5 +850,53 @@ class TsvbManager(private val context: Context) {
         val scaled = Bitmap.createScaledBitmap(cropped, targetWidth, targetHeight, true)
         if (scaled !== cropped) cropped.recycle()
         return scaled
+    }
+
+    // MARK: - Native error scraper integration
+
+    fun attachLogcatScraper(scraper: LogcatErrorScraper?) {
+        logcatScraper = scraper
+    }
+
+    /**
+     * Auto-starts a logcat scraper on SDK init so WATCHDOG_DUMP has data without requiring
+     * JS-side activation. Each match is forwarded to logcat as ERROR (sufficient for adb
+     * captures). Idempotent — second call after stop+start is fine.
+     */
+    private fun startInternalLogcatScraper() {
+        if (logcatScraper != null) return
+        val scraper = LogcatErrorScraper { match ->
+            Log.e(TAG, "NATIVE_ERROR pattern=${match.patternName} tag=${match.tag} " +
+                "level=${match.level} code=${match.errorCode ?: "-"} pid=${match.pid} tid=${match.tid} " +
+                "msg=${match.message.take(300)}")
+        }
+        logcatScraper = scraper
+        scraper.start()
+        Log.d(TAG, "Internal LogcatErrorScraper started")
+    }
+
+    private fun stopInternalLogcatScraper() {
+        logcatScraper?.stop()
+        logcatScraper = null
+    }
+
+    /**
+     * Dumps recently captured native errors (last 30s) into a single ERROR-level Log
+     * line so the host app's logger pipeline (DataDog/Sentry via JS bridge) ingests
+     * the SDK's own MediaPipe / libEGL output that we'd otherwise have no visibility
+     * into. Called when our SDK watchdog declares a hang.
+     */
+    private fun dumpScraperRingBuffer(reason: String, elapsedMs: Long) {
+        val scraper = logcatScraper ?: return
+        val cutoff = System.currentTimeMillis() - 30_000L
+        val recent = scraper.snapshotSince(cutoff)
+        if (recent.isEmpty()) {
+            Log.e(TAG, "WATCHDOG_DUMP reason=$reason elapsedMs=$elapsedMs — ring buffer empty (no native errors captured)")
+            return
+        }
+        val joined = recent.joinToString(separator = " || ") { match ->
+            "[${match.tag}/${match.level}] code=${match.errorCode ?: "-"} pat=${match.patternName} msg=${match.message.take(180)}"
+        }
+        Log.e(TAG, "WATCHDOG_DUMP reason=$reason elapsedMs=$elapsedMs count=${recent.size} entries=$joined")
     }
 }
