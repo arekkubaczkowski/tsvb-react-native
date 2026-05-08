@@ -5,7 +5,7 @@ Pod::Spec.new do |s|
   s.description    = 'Expo module that provides background blur functionality using TSVB Video Effects SDK'
   s.author         = ''
   s.homepage       = 'https://docs.expo.dev/modules/'
-  s.platforms      = { :ios => '13.4', :tvos => '13.4' }
+  s.platforms      = { :ios => '16.4' }
   s.source         = { git: '' }
   s.static_framework = true
 
