@@ -38,5 +38,5 @@ dependencies {
     implementation 'com.google.guava:guava:31.1-android'
 
     // WebRTC (provided by the app via react-native-webrtc)
-    compileOnly 'io.github.webrtc-sdk:android:137.7151.01'
+    compileOnly 'io.github.webrtc-sdk:android-prefixed:144.7559.15'
 }
