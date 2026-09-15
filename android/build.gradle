@@ -37,6 +37,10 @@ dependencies {
     implementation 'com.google.flogger:flogger-system-backend:0.7.4'
     implementation 'com.google.guava:guava:31.1-android'
 
-    // WebRTC (provided by the app via react-native-webrtc)
+    // WebRTC is provided at runtime by the app's react-native-webrtc fork, so this
+    // is compile-only. It must track the `api` line in that fork's android/build.gradle:
+    // a mismatch in the artifact NAME fails the build loudly, but a mismatch in the
+    // VERSION compiles fine and only shows up as a runtime NoSuchMethodError. This pin
+    // sat two majors behind (137 vs 144) for exactly that reason.
     compileOnly 'io.github.webrtc-sdk:android-prefixed:144.7559.15'
 }
