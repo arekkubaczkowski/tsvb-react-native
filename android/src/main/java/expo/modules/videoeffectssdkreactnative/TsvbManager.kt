@@ -442,8 +442,8 @@ class TsvbManager(private val context: Context) {
                 if (method.name == "createCapturer" && args != null && args.size == 3) {
                     val cameraName = args[0] as String
                     @Suppress("UNCHECKED_CAST")
-                    val eventsHandler = args[1] as org.webrtc.CameraVideoCapturer.CameraEventsHandler
-                    val enumerator = args[2] as org.webrtc.CameraEnumerator
+                    val eventsHandler = args[1] as livekit.org.webrtc.CameraVideoCapturer.CameraEventsHandler
+                    val enumerator = args[2] as livekit.org.webrtc.CameraEnumerator
                     Log.d(TAG, "CapturerProvider creating TsvbCapturer for: $cameraName")
                     val capturer = TsvbCapturer(cameraName, eventsHandler, enumerator, this)
                     // Atomic swap-and-dispose under lock so a previous live capturer (e.g. mid

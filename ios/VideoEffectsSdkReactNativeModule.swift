@@ -1,6 +1,6 @@
 import ExpoModulesCore
 import AVFoundation
-import WebRTC
+import LiveKitWebRTC
 import UIKit
 @preconcurrency import TSVB
 import os
@@ -224,12 +224,12 @@ final class TsvbVideoFrameProcessorBridge: NSObject {
     }
 
     /// Called by WebRTC's VideoEffectProcessor on the capture thread.
-    @objc func capturer(_ capturer: RTCVideoCapturer, didCaptureVideoFrame frame: RTCVideoFrame) -> RTCVideoFrame {
+    @objc func capturer(_ capturer: LKRTCVideoCapturer, didCaptureVideoFrame frame: LKRTCVideoFrame) -> LKRTCVideoFrame {
         guard processor.isActive || processor.isCaptureEnabled else {
             return frame
         }
 
-        guard let rtcBuffer = frame.buffer as? RTCCVPixelBuffer else {
+        guard let rtcBuffer = frame.buffer as? LKRTCCVPixelBuffer else {
             return frame
         }
 
@@ -237,8 +237,8 @@ final class TsvbVideoFrameProcessorBridge: NSObject {
             return frame
         }
 
-        let newBuffer = RTCCVPixelBuffer(pixelBuffer: processedBuffer)
-        return RTCVideoFrame(buffer: newBuffer, rotation: frame.rotation, timeStampNs: frame.timeStampNs)
+        let newBuffer = LKRTCCVPixelBuffer(pixelBuffer: processedBuffer)
+        return LKRTCVideoFrame(buffer: newBuffer, rotation: frame.rotation, timeStampNs: frame.timeStampNs)
     }
 }
 
